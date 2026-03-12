@@ -4,9 +4,135 @@
 
 #include <filesystem>
 #include <fstream>
+#include <cwctype>
+#include <system_error>
+#include <vector>
 
 namespace File
 {
+	namespace
+	{
+		std::wstring ToLower(std::wstring value)
+		{
+			for (auto& ch : value)
+			{
+				ch = static_cast<wchar_t>(towlower(ch));
+			}
+			return value;
+		}
+
+		std::filesystem::path NormalizePath(const std::filesystem::path& path)
+		{
+			std::error_code error;
+			auto absolute = std::filesystem::absolute(path, error);
+			if (error)
+			{
+				absolute = path;
+				error.clear();
+			}
+
+			auto canonical = std::filesystem::weakly_canonical(absolute, error);
+			if (!error)
+			{
+				return canonical;
+			}
+
+			return absolute.lexically_normal();
+		}
+
+		std::filesystem::path GetWorkingDirectoryPath()
+		{
+			return NormalizePath(std::filesystem::current_path());
+		}
+
+		std::filesystem::path FindSteamAppsDirectory(const std::filesystem::path& start)
+		{
+			auto current = NormalizePath(start);
+			for (;;)
+			{
+				if (ToLower(current.filename().wstring()) == L"steamapps")
+				{
+					return current;
+				}
+
+				std::error_code error;
+				auto nestedSteamApps = current / "steamapps";
+				if (std::filesystem::is_directory(nestedSteamApps, error))
+				{
+					return NormalizePath(nestedSteamApps);
+				}
+
+				auto parent = current.parent_path();
+				if (parent == current)
+				{
+					break;
+				}
+
+				current = parent;
+			}
+
+			return {};
+		}
+
+		std::filesystem::path GetWorkshopDirectoryPath()
+		{
+			std::filesystem::path bzrRoot = GetWorkingDirectoryPath();
+			std::filesystem::path steamapps = FindSteamAppsDirectory(bzrRoot);
+			if (steamapps.empty())
+			{
+				steamapps = bzrRoot.parent_path().parent_path();
+			}
+			return NormalizePath(steamapps / "workshop" / "content" / "301650");
+		}
+
+		bool IsPathInsideRoot(const std::filesystem::path& candidate, const std::filesystem::path& root)
+		{
+			if (root.empty())
+			{
+				return false;
+			}
+
+			auto normalizedCandidate = NormalizePath(candidate);
+			auto normalizedRoot = NormalizePath(root);
+
+			auto candidateIt = normalizedCandidate.begin();
+			auto rootIt = normalizedRoot.begin();
+			for (; rootIt != normalizedRoot.end(); ++rootIt, ++candidateIt)
+			{
+				if (candidateIt == normalizedCandidate.end())
+				{
+					return false;
+				}
+
+				if (ToLower(rootIt->wstring()) != ToLower(candidateIt->wstring()))
+				{
+					return false;
+				}
+			}
+
+			return true;
+		}
+
+		std::filesystem::path CheckWritePathAllowed(lua_State* L, const std::filesystem::path& requestedPath)
+		{
+			auto normalizedPath = NormalizePath(requestedPath);
+			auto workingRoot = GetWorkingDirectoryPath();
+			auto workshopRoot = GetWorkshopDirectoryPath();
+
+			if (IsPathInsideRoot(normalizedPath, workingRoot)
+				|| (!workshopRoot.empty() && IsPathInsideRoot(normalizedPath, workshopRoot)))
+			{
+				return normalizedPath;
+			}
+
+			luaL_error(
+				L,
+				"bzfile Error: refusing to write outside allowed roots. Path: \"%s\"",
+				normalizedPath.string().c_str());
+			return normalizedPath;
+		}
+	}
+
 #ifdef _DEBUG
 	void DebugPrint(lua_State* L, const char* message)
 	{
@@ -29,6 +155,7 @@ namespace File
 		}
 		else if (mode == "w")
 		{
+			fileName = CheckWritePathAllowed(L, fileName).string();
 			option = std::ios::out;
 			if (options == "app")
 			{
@@ -224,24 +351,20 @@ namespace File
 
 	static int GetWorkingDirectory(lua_State* L)
 	{
-		lua_pushstring(L, std::filesystem::current_path().string().c_str());
+		lua_pushstring(L, GetWorkingDirectoryPath().string().c_str());
 		return 1;
 	}
 
 	static int GetWorkshopDirectory(lua_State* L)
 	{
-		std::filesystem::path bzrRoot = std::filesystem::current_path();
-		std::filesystem::path steamapps = bzrRoot.parent_path().parent_path();
-		std::filesystem::path workshopDir = steamapps.append("workshop").append("content").append("301650");
-
-		lua_pushstring(L, workshopDir.string().c_str());
+		lua_pushstring(L, GetWorkshopDirectoryPath().string().c_str());
 		return 1;
 	}
 
 	static int MakeDirectory(lua_State* L)
 	{
 		const char* directory = luaL_checkstring(L, 1);
-		std::filesystem::create_directories(directory);
+		std::filesystem::create_directories(CheckWritePathAllowed(L, directory));
 		return 0;
 	}
 }
