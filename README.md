@@ -103,3 +103,18 @@ Gets the workshop directory (..\content\301650).
 bzfile.MakeDirectory(path: string) -> nil
 ```
 Makes a new directory at the given path.
+
+```lua
+bzfile.Exists(path: string) -> exists: boolean
+```
+Checks whether a file or directory exists.
+
+```lua
+bzfile.CopyFile(sourcePath: string, destinationPath: string, overwriteExisting: boolean?) -> success: boolean, errorMessage?: string
+```
+Copies a file as raw bytes. The destination must still be inside the game root or workshop root.
+
+```lua
+bzfile.GetFileHash(path: string, algorithm: string?) -> hash: string, errorMessage?: string
+```
+Returns a lowercase hex file hash. Currently `sha256` is supported.

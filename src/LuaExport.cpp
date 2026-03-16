@@ -1,11 +1,14 @@
 #include <lua.hpp>
 
 #include <Windows.h>
+#include <wincrypt.h>
 
 #include <filesystem>
 #include <fstream>
 #include <cwctype>
 #include <system_error>
+#include <sstream>
+#include <iomanip>
 #include <vector>
 
 namespace File
@@ -367,6 +370,140 @@ namespace File
 		std::filesystem::create_directories(CheckWritePathAllowed(L, directory));
 		return 0;
 	}
+
+	static int Exists(lua_State* L)
+	{
+		const char* filePath = luaL_checkstring(L, 1);
+		std::error_code error;
+		auto normalizedPath = NormalizePath(filePath);
+		bool exists = std::filesystem::exists(normalizedPath, error);
+
+		lua_pushboolean(L, !error && exists);
+		return 1;
+	}
+
+	static int CopyFile(lua_State* L)
+	{
+		const char* sourcePath = luaL_checkstring(L, 1);
+		const char* destinationPath = luaL_checkstring(L, 2);
+		bool overwriteExisting = lua_toboolean(L, 3) != 0;
+
+		auto normalizedSource = NormalizePath(sourcePath);
+		auto normalizedDestination = CheckWritePathAllowed(L, destinationPath);
+
+		std::error_code error;
+		auto copyOptions = overwriteExisting
+			? std::filesystem::copy_options::overwrite_existing
+			: std::filesystem::copy_options::none;
+
+		bool copied = std::filesystem::copy_file(normalizedSource, normalizedDestination, copyOptions, error);
+		lua_pushboolean(L, copied);
+		if (!copied)
+		{
+			auto errorMessage = error ? error.message() : "copy failed";
+			lua_pushstring(L, errorMessage.c_str());
+			return 2;
+		}
+
+		return 1;
+	}
+
+	static int GetFileHash(lua_State* L)
+	{
+		const char* filePath = luaL_checkstring(L, 1);
+		const char* algorithm = luaL_optstring(L, 2, "sha256");
+		auto normalizedPath = NormalizePath(filePath);
+
+		ALG_ID algorithmId = 0;
+		if (_stricmp(algorithm, "sha256") == 0)
+		{
+			algorithmId = CALG_SHA_256;
+		}
+		else
+		{
+			luaL_error(L, "bzfile Error: unsupported hash algorithm \"%s\"", algorithm);
+			return 0;
+		}
+
+		std::ifstream input(normalizedPath, std::ios::binary);
+		if (!input.is_open())
+		{
+			lua_pushnil(L);
+			lua_pushfstring(L, "could not open \"%s\"", normalizedPath.string().c_str());
+			return 2;
+		}
+
+		HCRYPTPROV provider = 0;
+		HCRYPTHASH hashHandle = 0;
+		if (!CryptAcquireContext(&provider, nullptr, nullptr, PROV_RSA_AES, CRYPT_VERIFYCONTEXT))
+		{
+			lua_pushnil(L);
+			lua_pushstring(L, "CryptAcquireContext failed");
+			return 2;
+		}
+
+		if (!CryptCreateHash(provider, algorithmId, 0, 0, &hashHandle))
+		{
+			CryptReleaseContext(provider, 0);
+			lua_pushnil(L);
+			lua_pushstring(L, "CryptCreateHash failed");
+			return 2;
+		}
+
+		std::vector<char> buffer(64 * 1024);
+		while (input.good())
+		{
+			input.read(buffer.data(), static_cast<std::streamsize>(buffer.size()));
+			auto bytesRead = input.gcount();
+			if (bytesRead <= 0)
+			{
+				break;
+			}
+
+			if (!CryptHashData(hashHandle, reinterpret_cast<const BYTE*>(buffer.data()), static_cast<DWORD>(bytesRead), 0))
+			{
+				CryptDestroyHash(hashHandle);
+				CryptReleaseContext(provider, 0);
+				lua_pushnil(L);
+				lua_pushstring(L, "CryptHashData failed");
+				return 2;
+			}
+		}
+
+		DWORD hashLength = 0;
+		DWORD hashLengthSize = sizeof(hashLength);
+		if (!CryptGetHashParam(hashHandle, HP_HASHSIZE, reinterpret_cast<BYTE*>(&hashLength), &hashLengthSize, 0))
+		{
+			CryptDestroyHash(hashHandle);
+			CryptReleaseContext(provider, 0);
+			lua_pushnil(L);
+			lua_pushstring(L, "CryptGetHashParam(size) failed");
+			return 2;
+		}
+
+		std::vector<BYTE> hashBytes(hashLength);
+		if (!CryptGetHashParam(hashHandle, HP_HASHVAL, hashBytes.data(), &hashLength, 0))
+		{
+			CryptDestroyHash(hashHandle);
+			CryptReleaseContext(provider, 0);
+			lua_pushnil(L);
+			lua_pushstring(L, "CryptGetHashParam(value) failed");
+			return 2;
+		}
+
+		CryptDestroyHash(hashHandle);
+		CryptReleaseContext(provider, 0);
+
+		std::ostringstream hex;
+		hex << std::hex << std::setfill('0');
+		for (BYTE value : hashBytes)
+		{
+			hex << std::setw(2) << static_cast<unsigned int>(value);
+		}
+
+		lua_pushstring(L, hex.str().c_str());
+		return 1;
+	}
 }
 
 static int lua_Init(lua_State* L)
@@ -419,6 +556,9 @@ extern "C" int __declspec(dllexport) luaopen_bzfile(lua_State* L)
 		{ "GetWorkingDirectory", &File::GetWorkingDirectory },
 		{ "GetWorkshopDirectory", &File::GetWorkshopDirectory },
 		{ "MakeDirectory", &File::MakeDirectory },
+		{ "Exists", &File::Exists },
+		{ "CopyFile", &File::CopyFile },
+		{ "GetFileHash", &File::GetFileHash },
 		{0, 0}
 	};
 
