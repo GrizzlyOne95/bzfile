@@ -1,6 +1,20 @@
 # bzfile
 File IO Library for Battlezone 98 Redux
 
+## High-Level Summary
+
+- Lightweight Lua-facing file I/O for Battlezone 98 Redux mods and addon tools.
+- Covers the core text-file workflow: open, read, write, flush, close, working
+  directory discovery, workshop directory discovery, directory creation, and
+  existence checks.
+- Current repo-side improvements focus on safer update and deployment workflows:
+  guarded copy operations, a deferred replace-on-exit path for files that may be
+  locked while the game is running, and stricter resolution of allowed game and
+  workshop write roots.
+- File hashing support is included for patch/update verification, and the
+  bundled Lua library snapshot has been refreshed to stay aligned with the
+  repaired runtime used by the surrounding Battlezone tooling stack.
+
 Quick and dirty tutorial:
 
 ```lua
