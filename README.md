@@ -115,6 +115,15 @@ bzfile.CopyFile(sourcePath: string, destinationPath: string, overwriteExisting: 
 Copies a file as raw bytes. The destination must still be inside the game root or workshop root.
 
 ```lua
+bzfile.ReplaceFileOnExit(sourcePath: string, destinationPath: string) -> success: boolean, errorMessage?: string
+```
+Stages a replacement file under the allowed write roots, then launches a hidden
+helper that waits for the current game process to exit before force-copying the
+staged file onto the destination. This is useful for replacing loaded DLLs such
+as `winmm.dll` that cannot always be overwritten in-place while Battlezone is
+still running.
+
+```lua
 bzfile.GetFileHash(path: string, algorithm: string?) -> hash: string, errorMessage?: string
 ```
 Returns a lowercase hex file hash. Currently `sha256` is supported.

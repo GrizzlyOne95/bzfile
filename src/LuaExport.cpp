@@ -6,6 +6,7 @@
 #include <filesystem>
 #include <fstream>
 #include <cwctype>
+#include <string>
 #include <system_error>
 #include <sstream>
 #include <iomanip>
@@ -133,6 +134,73 @@ namespace File
 				"bzfile Error: refusing to write outside allowed roots. Path: \"%s\"",
 				normalizedPath.string().c_str());
 			return normalizedPath;
+		}
+
+		std::wstring EscapePowerShellSingleQuoted(const std::wstring& value)
+		{
+			std::wstring escaped;
+			escaped.reserve(value.size());
+			for (wchar_t ch : value)
+			{
+				escaped.push_back(ch);
+				if (ch == L'\'')
+				{
+					escaped.push_back(L'\'');
+				}
+			}
+			return escaped;
+		}
+
+		std::string NarrowSystemError(DWORD errorCode)
+		{
+			std::error_code error(static_cast<int>(errorCode), std::system_category());
+			return error.message();
+		}
+
+		bool LaunchHiddenPowerShell(const std::wstring& command, std::string& errorMessage)
+		{
+			wchar_t systemDirectory[MAX_PATH] = {};
+			UINT length = GetSystemDirectoryW(systemDirectory, MAX_PATH);
+			std::wstring executable = L"powershell.exe";
+			if (length > 0 && length < MAX_PATH)
+			{
+				executable.assign(systemDirectory, systemDirectory + length);
+				executable += L"\\WindowsPowerShell\\v1.0\\powershell.exe";
+			}
+
+			std::wstring arguments =
+				L" -NoProfile -NonInteractive -WindowStyle Hidden -ExecutionPolicy Bypass -Command \"" +
+				command + L"\"";
+			std::wstring commandLine = L"\"" + executable + L"\"" + arguments;
+			std::vector<wchar_t> mutableCommand(commandLine.begin(), commandLine.end());
+			mutableCommand.push_back(L'\0');
+
+			STARTUPINFOW startupInfo = {};
+			startupInfo.cb = sizeof(startupInfo);
+			startupInfo.dwFlags = STARTF_USESHOWWINDOW;
+			startupInfo.wShowWindow = SW_HIDE;
+
+			PROCESS_INFORMATION processInfo = {};
+			BOOL created = CreateProcessW(
+				executable.c_str(),
+				mutableCommand.data(),
+				nullptr,
+				nullptr,
+				FALSE,
+				CREATE_NO_WINDOW | DETACHED_PROCESS,
+				nullptr,
+				nullptr,
+				&startupInfo,
+				&processInfo);
+			if (!created)
+			{
+				errorMessage = NarrowSystemError(GetLastError());
+				return false;
+			}
+
+			CloseHandle(processInfo.hThread);
+			CloseHandle(processInfo.hProcess);
+			return true;
 		}
 	}
 
@@ -408,6 +476,63 @@ namespace File
 		return 1;
 	}
 
+	static int ReplaceFileOnExit(lua_State* L)
+	{
+		const char* sourcePath = luaL_checkstring(L, 1);
+		const char* destinationPath = luaL_checkstring(L, 2);
+
+		auto normalizedSource = NormalizePath(sourcePath);
+		auto normalizedDestination = CheckWritePathAllowed(L, destinationPath);
+		auto stagedPath = normalizedDestination;
+		stagedPath += ".pending";
+
+		std::error_code error;
+		std::filesystem::copy_file(
+			normalizedSource,
+			stagedPath,
+			std::filesystem::copy_options::overwrite_existing,
+			error);
+		if (error)
+		{
+			lua_pushboolean(L, 0);
+			lua_pushstring(L, error.message().c_str());
+			return 2;
+		}
+
+		const DWORD currentProcessId = GetCurrentProcessId();
+		const std::wstring escapedStage = EscapePowerShellSingleQuoted(stagedPath.wstring());
+		const std::wstring escapedDestination = EscapePowerShellSingleQuoted(normalizedDestination.wstring());
+
+		std::wstringstream command;
+		command
+			<< L"$pidToWait=" << currentProcessId << L";"
+			<< L"$src='" << escapedStage << L"';"
+			<< L"$dst='" << escapedDestination << L"';"
+			<< L"while (Get-Process -Id $pidToWait -ErrorAction SilentlyContinue) { Start-Sleep -Milliseconds 500 };"
+			<< L"for ($i = 0; $i -lt 80; $i++) {"
+			<< L"  try {"
+			<< L"    Copy-Item -LiteralPath $src -Destination $dst -Force -ErrorAction Stop;"
+			<< L"    Remove-Item -LiteralPath $src -Force -ErrorAction SilentlyContinue;"
+			<< L"    exit 0"
+			<< L"  } catch {"
+			<< L"    Start-Sleep -Milliseconds 250"
+			<< L"  }"
+			<< L"};"
+			<< L"exit 1";
+
+		std::string launchError;
+		if (!LaunchHiddenPowerShell(command.str(), launchError))
+		{
+			std::filesystem::remove(stagedPath, error);
+			lua_pushboolean(L, 0);
+			lua_pushstring(L, launchError.c_str());
+			return 2;
+		}
+
+		lua_pushboolean(L, 1);
+		return 1;
+	}
+
 	static int GetFileHash(lua_State* L)
 	{
 		const char* filePath = luaL_checkstring(L, 1);
@@ -558,6 +683,7 @@ extern "C" int __declspec(dllexport) luaopen_bzfile(lua_State* L)
 		{ "MakeDirectory", &File::MakeDirectory },
 		{ "Exists", &File::Exists },
 		{ "CopyFile", &File::CopyFile },
+		{ "ReplaceFileOnExit", &File::ReplaceFileOnExit },
 		{ "GetFileHash", &File::GetFileHash },
 		{0, 0}
 	};
