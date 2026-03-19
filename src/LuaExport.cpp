@@ -450,24 +450,44 @@ namespace File
 		return 1;
 	}
 
-	static int CopyFile(lua_State* L)
-	{
-		const char* sourcePath = luaL_checkstring(L, 1);
-		const char* destinationPath = luaL_checkstring(L, 2);
-		bool overwriteExisting = lua_toboolean(L, 3) != 0;
-
-		auto normalizedSource = NormalizePath(sourcePath);
-		auto normalizedDestination = CheckWritePathAllowed(L, destinationPath);
-
-		std::error_code error;
-		auto copyOptions = overwriteExisting
-			? std::filesystem::copy_options::overwrite_existing
-			: std::filesystem::copy_options::none;
-
-		bool copied = std::filesystem::copy_file(normalizedSource, normalizedDestination, copyOptions, error);
-		lua_pushboolean(L, copied);
-		if (!copied)
+		static int CopyFile(lua_State* L)
 		{
+			const char* sourcePath = luaL_checkstring(L, 1);
+			const char* destinationPath = luaL_checkstring(L, 2);
+			bool overwriteExisting = lua_toboolean(L, 3) != 0;
+
+			auto normalizedSource = NormalizePath(sourcePath);
+			auto normalizedDestination = CheckWritePathAllowed(L, destinationPath);
+
+			std::error_code error;
+			auto copyOptions = overwriteExisting
+				? std::filesystem::copy_options::overwrite_existing
+				: std::filesystem::copy_options::none;
+
+			if (overwriteExisting && std::filesystem::exists(normalizedDestination, error))
+			{
+				error.clear();
+
+				// Best-effort force replace for existing shims: clear common blocking
+				// attributes and remove the old file before copying the new one in.
+				auto destinationWide = normalizedDestination.wstring();
+				SetFileAttributesW(destinationWide.c_str(), FILE_ATTRIBUTE_NORMAL);
+
+				std::error_code removeError;
+				if (std::filesystem::remove(normalizedDestination, removeError))
+				{
+					copyOptions = std::filesystem::copy_options::none;
+				}
+				else if (removeError)
+				{
+					error = removeError;
+				}
+			}
+
+			bool copied = std::filesystem::copy_file(normalizedSource, normalizedDestination, copyOptions, error);
+			lua_pushboolean(L, copied);
+			if (!copied)
+			{
 			auto errorMessage = error ? error.message() : "copy failed";
 			lua_pushstring(L, errorMessage.c_str());
 			return 2;
