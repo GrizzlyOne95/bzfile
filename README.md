@@ -135,7 +135,9 @@ Stages a replacement file under the allowed write roots, then launches a hidden
 helper that waits for the current game process to exit before force-copying the
 staged file onto the destination. This is useful for replacing loaded DLLs such
 as `winmm.dll` that cannot always be overwritten in-place while Battlezone is
-still running.
+still running. Ship `bzfile_replace_helper.exe` beside `bzfile.dll`; the helper
+also writes a `<destination-stem>_replace.log` file next to the target when it
+runs.
 
 ```lua
 bzfile.GetFileHash(path: string, algorithm: string?) -> hash: string, errorMessage?: string

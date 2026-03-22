@@ -109,6 +109,12 @@
     <ClCompile Include="src\dllmain.cpp" />
     <ClCompile Include="src\LuaExport.cpp" />
   </ItemGroup>
+  <ItemGroup>
+    <ProjectReference Include="bzfile_replace_helper.vcxproj">
+      <Project>{F743A764-15F6-4E66-8E44-9C4E4F5236C1}</Project>
+      <ReferenceOutputAssembly>false</ReferenceOutputAssembly>
+    </ProjectReference>
+  </ItemGroup>
   <Import Project="$(VCTargetsPath)\Microsoft.Cpp.targets" />
   <ImportGroup Label="ExtensionTargets">
   </ImportGroup>
