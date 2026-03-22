@@ -136,19 +136,79 @@ namespace File
 			return normalizedPath;
 		}
 
-		std::wstring EscapePowerShellSingleQuoted(const std::wstring& value)
+		std::wstring QuoteCommandLineArgument(const std::wstring& value)
 		{
-			std::wstring escaped;
-			escaped.reserve(value.size());
+			if (value.empty())
+			{
+				return L"\"\"";
+			}
+
+			if (value.find_first_of(L" \t\n\v\"") == std::wstring::npos)
+			{
+				return value;
+			}
+
+			std::wstring quoted;
+			quoted.push_back(L'"');
+
+			size_t backslashCount = 0;
 			for (wchar_t ch : value)
 			{
-				escaped.push_back(ch);
-				if (ch == L'\'')
+				if (ch == L'\\')
 				{
-					escaped.push_back(L'\'');
+					++backslashCount;
+					continue;
 				}
+
+				if (ch == L'"')
+				{
+					quoted.append(backslashCount * 2 + 1, L'\\');
+					quoted.push_back(ch);
+					backslashCount = 0;
+					continue;
+				}
+
+				quoted.append(backslashCount, L'\\');
+				backslashCount = 0;
+				quoted.push_back(ch);
 			}
-			return escaped;
+
+			quoted.append(backslashCount * 2, L'\\');
+			quoted.push_back(L'"');
+			return quoted;
+		}
+
+		std::filesystem::path GetCurrentModulePath()
+		{
+			HMODULE moduleHandle = nullptr;
+			if (!GetModuleHandleExW(
+				GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+				reinterpret_cast<LPCWSTR>(&GetCurrentModulePath),
+				&moduleHandle))
+			{
+				return {};
+			}
+
+			std::wstring modulePath(MAX_PATH, L'\0');
+			for (;;)
+			{
+				DWORD length = GetModuleFileNameW(
+					moduleHandle,
+					modulePath.data(),
+					static_cast<DWORD>(modulePath.size()));
+				if (length == 0)
+				{
+					return {};
+				}
+
+				if (length < modulePath.size())
+				{
+					modulePath.resize(length);
+					return std::filesystem::path(modulePath);
+				}
+
+				modulePath.resize(modulePath.size() * 2);
+			}
 		}
 
 		std::string NarrowSystemError(DWORD errorCode)
@@ -157,21 +217,18 @@ namespace File
 			return error.message();
 		}
 
-		bool LaunchHiddenPowerShell(const std::wstring& command, std::string& errorMessage)
+		bool LaunchHiddenProcess(
+			const std::wstring& executable,
+			const std::vector<std::wstring>& arguments,
+			std::string& errorMessage)
 		{
-			wchar_t systemDirectory[MAX_PATH] = {};
-			UINT length = GetSystemDirectoryW(systemDirectory, MAX_PATH);
-			std::wstring executable = L"powershell.exe";
-			if (length > 0 && length < MAX_PATH)
+			std::wstring commandLine = QuoteCommandLineArgument(executable);
+			for (const auto& argument : arguments)
 			{
-				executable.assign(systemDirectory, systemDirectory + length);
-				executable += L"\\WindowsPowerShell\\v1.0\\powershell.exe";
+				commandLine.push_back(L' ');
+				commandLine += QuoteCommandLineArgument(argument);
 			}
 
-			std::wstring arguments =
-				L" -NoProfile -NonInteractive -WindowStyle Hidden -ExecutionPolicy Bypass -Command \"" +
-				command + L"\"";
-			std::wstring commandLine = L"\"" + executable + L"\"" + arguments;
 			std::vector<wchar_t> mutableCommand(commandLine.begin(), commandLine.end());
 			mutableCommand.push_back(L'\0');
 
@@ -520,28 +577,47 @@ namespace File
 		}
 
 		const DWORD currentProcessId = GetCurrentProcessId();
-		const std::wstring escapedStage = EscapePowerShellSingleQuoted(stagedPath.wstring());
-		const std::wstring escapedDestination = EscapePowerShellSingleQuoted(normalizedDestination.wstring());
+		auto modulePath = GetCurrentModulePath();
+		if (modulePath.empty())
+		{
+			std::filesystem::remove(stagedPath, error);
+			lua_pushboolean(L, 0);
+			lua_pushstring(L, "could not resolve bzfile module path");
+			return 2;
+		}
 
-		std::wstringstream command;
-		command
-			<< L"$pidToWait=" << currentProcessId << L";"
-			<< L"$src='" << escapedStage << L"';"
-			<< L"$dst='" << escapedDestination << L"';"
-			<< L"while (Get-Process -Id $pidToWait -ErrorAction SilentlyContinue) { Start-Sleep -Milliseconds 500 };"
-			<< L"for ($i = 0; $i -lt 80; $i++) {"
-			<< L"  try {"
-			<< L"    Copy-Item -LiteralPath $src -Destination $dst -Force -ErrorAction Stop;"
-			<< L"    Remove-Item -LiteralPath $src -Force -ErrorAction SilentlyContinue;"
-			<< L"    exit 0"
-			<< L"  } catch {"
-			<< L"    Start-Sleep -Milliseconds 250"
-			<< L"  }"
-			<< L"};"
-			<< L"exit 1";
+		auto helperPath = modulePath.parent_path() / L"bzfile_replace_helper.exe";
+
+		error.clear();
+		if (!std::filesystem::exists(helperPath, error))
+		{
+			std::filesystem::remove(stagedPath, error);
+			auto message = "helper executable not found: " + helperPath.string();
+			lua_pushboolean(L, 0);
+			lua_pushstring(L, message.c_str());
+			return 2;
+		}
+
+		auto logStem = normalizedDestination.stem().wstring();
+		if (logStem.empty())
+		{
+			logStem = normalizedDestination.filename().wstring();
+		}
+		if (logStem.empty())
+		{
+			logStem = L"bzfile";
+		}
+
+		auto logPath = normalizedDestination.parent_path() / (logStem + L"_replace.log");
+		std::vector<std::wstring> arguments = {
+			std::to_wstring(currentProcessId),
+			stagedPath.wstring(),
+			normalizedDestination.wstring(),
+			logPath.wstring()
+		};
 
 		std::string launchError;
-		if (!LaunchHiddenPowerShell(command.str(), launchError))
+		if (!LaunchHiddenProcess(helperPath.wstring(), arguments, launchError))
 		{
 			std::filesystem::remove(stagedPath, error);
 			lua_pushboolean(L, 0);
