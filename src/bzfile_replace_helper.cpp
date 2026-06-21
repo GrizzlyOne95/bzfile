@@ -126,6 +126,7 @@ namespace
 			if (openError == ERROR_INVALID_PARAMETER)
 			{
 				AppendLogLine(logPath, L"Process already exited before helper wait began.");
+				Sleep(1000); // Give some extra time for handles to release
 				return true;
 			}
 
@@ -140,6 +141,7 @@ namespace
 		if (waitResult == WAIT_OBJECT_0)
 		{
 			AppendLogLine(logPath, L"Observed target process exit.");
+			Sleep(1000); // Give some extra time for handles to release
 			return true;
 		}
 
@@ -163,7 +165,7 @@ namespace
 			if (MoveFileExW(
 				stagedPath.c_str(),
 				destinationPath.c_str(),
-				MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH))
+				MOVEFILE_REPLACE_EXISTING | MOVEFILE_COPY_ALLOWED | MOVEFILE_WRITE_THROUGH))
 			{
 				if (std::filesystem::exists(stagedPath))
 				{
