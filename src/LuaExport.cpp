@@ -16,6 +16,8 @@ namespace File
 {
 	namespace
 	{
+		bool g_AllowWinmmOverwrite = false;
+
 		std::wstring ToLower(std::wstring value)
 		{
 			for (auto& ch : value)
@@ -129,10 +131,12 @@ namespace File
 				return normalizedPath;
 			}
 
-			return luaL_error(
+			luaL_error(
 				L,
 				"bzfile Error: refusing to access path outside allowed roots. Path: \"%s\"",
-				normalizedPath.string().c_str()), normalizedPath;
+				normalizedPath.string().c_str());
+
+			return {};
 		}
 
 		std::wstring QuoteCommandLineArgument(const std::wstring& value)
@@ -315,16 +319,15 @@ namespace File
 		void* buffer = lua_newuserdata(L, sizeof(std::fstream));
 		std::fstream* fs = new (buffer) std::fstream(filePath, openMode);
 
+		luaL_getmetatable(L, "FileMetatable");
+		lua_setmetatable(L, -2);
+
 		if (!fs->is_open())
 		{
-			fs->~basic_fstream();
 			lua_pushnil(L);
 			lua_pushfstring(L, "bzfile Error: could not open file \"%s\"", filePath.string().c_str());
 			return 2;
 		}
-
-		luaL_getmetatable(L, "FileMetatable");
-		lua_setmetatable(L, -2);
 
 		return 1;
 	}
@@ -519,34 +522,34 @@ namespace File
 		std::filesystem::path destinationPath = CheckPathAllowed(L, luaL_checkstring(L, 2));
 		bool overwriteExisting = lua_toboolean(L, 3) != 0;
 
-			std::error_code error;
-			auto copyOptions = overwriteExisting
-				? std::filesystem::copy_options::overwrite_existing
-				: std::filesystem::copy_options::none;
+		std::error_code error;
+		auto copyOptions = overwriteExisting
+			? std::filesystem::copy_options::overwrite_existing
+			: std::filesystem::copy_options::none;
 
-			if (overwriteExisting && std::filesystem::exists(normalizedDestination, error))
+		if (overwriteExisting && std::filesystem::exists(destinationPath, error))
+		{
+			error.clear();
+
+			// Best-effort force replace for existing shims: clear common blocking
+			// attributes and remove the old file before copying the new one in.
+			auto destinationWide = destinationPath.wstring();
+			SetFileAttributesW(destinationWide.c_str(), FILE_ATTRIBUTE_NORMAL);
+
+			std::error_code removeError;
+			if (std::filesystem::remove(destinationPath, removeError))
 			{
-				error.clear();
-
-				// Best-effort force replace for existing shims: clear common blocking
-				// attributes and remove the old file before copying the new one in.
-				auto destinationWide = normalizedDestination.wstring();
-				SetFileAttributesW(destinationWide.c_str(), FILE_ATTRIBUTE_NORMAL);
-
-				std::error_code removeError;
-				if (std::filesystem::remove(normalizedDestination, removeError))
-				{
-					copyOptions = std::filesystem::copy_options::none;
-				}
-				else if (removeError)
-				{
-					error = removeError;
-				}
+				copyOptions = std::filesystem::copy_options::none;
 			}
+			else if (removeError)
+			{
+				error = removeError;
+			}
+		}
 
-			bool copied = std::filesystem::copy_file(normalizedSource, normalizedDestination, copyOptions, error);
-			lua_pushboolean(L, copied);
-			if (!copied)
+		bool copied = std::filesystem::copy_file(sourcePath, destinationPath, copyOptions, error);
+		lua_pushboolean(L, copied);
+		if (!copied)
 			{
 			auto errorMessage = error ? error.message() : "copy failed";
 			lua_pushstring(L, errorMessage.c_str());
@@ -560,12 +563,20 @@ namespace File
 	{
 		std::filesystem::path sourcePath = CheckPathAllowed(L, luaL_checkstring(L, 1));
 		std::filesystem::path destinationPath = CheckPathAllowed(L, luaL_checkstring(L, 2));
-		auto stagedPath = normalizedDestination;
+
+		if (!g_AllowWinmmOverwrite && ToLower(destinationPath.filename().wstring()) == L"winmm.dll")
+		{
+			lua_pushboolean(L, 0);
+			lua_pushstring(L, "bzfile Error: winmm.dll overwrite is disabled");
+			return 2;
+		}
+
+		auto stagedPath = destinationPath;
 		stagedPath += ".pending";
 
 		std::error_code error;
 		std::filesystem::copy_file(
-			normalizedSource,
+			sourcePath,
 			stagedPath,
 			std::filesystem::copy_options::overwrite_existing,
 			error);
@@ -598,21 +609,21 @@ namespace File
 			return 2;
 		}
 
-		auto logStem = normalizedDestination.stem().wstring();
+		auto logStem = destinationPath.stem().wstring();
 		if (logStem.empty())
 		{
-			logStem = normalizedDestination.filename().wstring();
+			logStem = destinationPath.filename().wstring();
 		}
 		if (logStem.empty())
 		{
 			logStem = L"bzfile";
 		}
 
-		auto logPath = normalizedDestination.parent_path() / (logStem + L"_replace.log");
+		auto logPath = destinationPath.parent_path() / (logStem + L"_replace.log");
 		std::vector<std::wstring> arguments = {
 			std::to_wstring(currentProcessId),
 			stagedPath.wstring(),
-			normalizedDestination.wstring(),
+			destinationPath.wstring(),
 			logPath.wstring()
 		};
 
@@ -773,6 +784,18 @@ namespace File
 
 		return 1;
 	}
+
+	static int SetAllowWinmmOverwrite(lua_State* L)
+	{
+		g_AllowWinmmOverwrite = lua_toboolean(L, 1) != 0;
+		return 0;
+	}
+
+	static int GetAllowWinmmOverwrite(lua_State* L)
+	{
+		lua_pushboolean(L, g_AllowWinmmOverwrite);
+		return 1;
+	}
 }
 
 static int lua_Init(lua_State* L)
@@ -831,6 +854,8 @@ extern "C" int __declspec(dllexport) luaopen_bzfile(lua_State* L)
 		{ "GetFileHash", &File::GetFileHash },
 		{ "Delete", &File::Delete },
 		{ "ListDirectory", &File::ListDirectory },
+		{ "SetAllowWinmmOverwrite", &File::SetAllowWinmmOverwrite },
+		{ "GetAllowWinmmOverwrite", &File::GetAllowWinmmOverwrite },
 		{0, 0}
 	};
 
