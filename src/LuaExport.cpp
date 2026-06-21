@@ -117,7 +117,7 @@ namespace File
 			return true;
 		}
 
-		std::filesystem::path CheckWritePathAllowed(lua_State* L, const std::filesystem::path& requestedPath)
+		std::filesystem::path CheckPathAllowed(lua_State* L, const std::filesystem::path& requestedPath)
 		{
 			auto normalizedPath = NormalizePath(requestedPath);
 			auto workingRoot = GetWorkingDirectoryPath();
@@ -129,11 +129,10 @@ namespace File
 				return normalizedPath;
 			}
 
-			luaL_error(
+			return luaL_error(
 				L,
-				"bzfile Error: refusing to write outside allowed roots. Path: \"%s\"",
-				normalizedPath.string().c_str());
-			return normalizedPath;
+				"bzfile Error: refusing to access path outside allowed roots. Path: \"%s\"",
+				normalizedPath.string().c_str()), normalizedPath;
 		}
 
 		std::wstring QuoteCommandLineArgument(const std::wstring& value)
@@ -272,41 +271,57 @@ namespace File
 
 	static int Open(lua_State* L)
 	{
-		std::string fileName = luaL_checkstring(L, 1);
-		std::string mode = luaL_optstring(L, 2, "r");
+		std::filesystem::path filePath = CheckPathAllowed(L, luaL_checkstring(L, 1));
+		std::string modeStr = luaL_optstring(L, 2, "r");
 		std::string options = luaL_optstring(L, 3, "app");
 
-		std::ios_base::openmode option{};
-		if (mode == "r")
+		std::ios_base::openmode openMode{};
+		bool isWrite = false;
+
+		if (modeStr.find('r') != std::string::npos)
 		{
-			option = std::ios::in;
+			openMode |= std::ios::in;
 		}
-		else if (mode == "w")
+		if (modeStr.find('w') != std::string::npos)
 		{
-			fileName = CheckWritePathAllowed(L, fileName).string();
-			option = std::ios::out;
+			openMode |= std::ios::out;
+			isWrite = true;
+		}
+		if (modeStr.find('b') != std::string::npos)
+		{
+			openMode |= std::ios::binary;
+		}
+
+		if (isWrite)
+		{
 			if (options == "app")
 			{
-				option |= std::ios::app;
+				openMode |= std::ios::app;
 			}
 			else if (options == "trunc")
 			{
-				option |= std::ios::trunc;
+				openMode |= std::ios::trunc;
 			}
 			else
 			{
-				lua_pop(L, -1);
-				luaL_error(L, "bzfile Error: invalid open option \"%s\"", options.c_str());
+				return luaL_error(L, "bzfile Error: invalid open option \"%s\"", options.c_str());
 			}
 		}
-		else
+		else if (openMode == 0)
 		{
-			lua_pop(L, -1);
-			luaL_error(L, "bzfile Error: invalid open mode \"%s\"", mode.c_str());
+			return luaL_error(L, "bzfile Error: invalid open mode \"%s\"", modeStr.c_str());
 		}
 
-		void* buffer = lua_newuserdata(L, sizeof(std::fstream)); // allocate memory in lua
-		new (buffer) std::fstream(fileName, option); // emplace fstream object in lua's memory
+		void* buffer = lua_newuserdata(L, sizeof(std::fstream));
+		std::fstream* fs = new (buffer) std::fstream(filePath, openMode);
+
+		if (!fs->is_open())
+		{
+			fs->~basic_fstream();
+			lua_pushnil(L);
+			lua_pushfstring(L, "bzfile Error: could not open file \"%s\"", filePath.string().c_str());
+			return 2;
+		}
 
 		luaL_getmetatable(L, "FileMetatable");
 		lua_setmetatable(L, -2);
@@ -317,29 +332,35 @@ namespace File
 	static int Cleanup(lua_State* L)
 	{
 		std::fstream* handle = (std::fstream*)lua_touserdata(L, 1);
-		handle->~basic_fstream(); // need to call destructor manually since lua is managing the memory
+		if (handle)
+		{
+			handle->~basic_fstream();
+		}
 		return 0;
 	}
 
 	static int Write(lua_State* L)
 	{
-		std::fstream* handle = (std::fstream*)lua_touserdata(L, 1);
+		std::fstream* handle = (std::fstream*)luaL_checkudata(L, 1, "FileMetatable");
+		if (!handle->is_open()) return luaL_error(L, "bzfile Error: file is not open");
 
-		const char* content = luaL_checkstring(L, 2);
-		*handle << content;
+		size_t len;
+		const char* content = luaL_checklstring(L, 2, &len);
+		handle->write(content, len);
 
-		// This is equivalent to return *this
-		// allows for method chaining on the lua side
 		lua_pushvalue(L, 1);
 		return 1;
 	}
 
 	static int Writeln(lua_State* L)
 	{
-		std::fstream* handle = (std::fstream*)lua_touserdata(L, 1);
+		std::fstream* handle = (std::fstream*)luaL_checkudata(L, 1, "FileMetatable");
+		if (!handle->is_open()) return luaL_error(L, "bzfile Error: file is not open");
 
-		const char* content = luaL_checkstring(L, 2);
-		*handle << content << '\n';
+		size_t len;
+		const char* content = luaL_checklstring(L, 2, &len);
+		handle->write(content, len);
+		handle->put('\n');
 
 		lua_pushvalue(L, 1);
 		return 1;
@@ -347,22 +368,10 @@ namespace File
 
 	static int Read(lua_State* L)
 	{
-		std::fstream* handle = (std::fstream*)lua_touserdata(L, 1);
+		std::fstream* handle = (std::fstream*)luaL_checkudata(L, 1, "FileMetatable");
+		if (!handle->is_open()) return luaL_error(L, "bzfile Error: file is not open");
+
 		int count = luaL_optint(L, 2, 1);
-
-#ifdef _DEBUG
-		if (!lua_isuserdata(L, 1))
-		{
-			lua_pop(L, -1);
-			luaL_error(L, "not userdata");
-		}
-
-		if (!handle->is_open())
-		{
-			lua_pop(L, -1);
-			luaL_error(L, "not open");
-		}
-#endif
 
 		if (handle->eof())
 		{
@@ -373,9 +382,14 @@ namespace File
 		if (count <= 1)
 		{
 			char c;
-			handle->get(c);
-
-			lua_pushlstring(L, &c, 1);
+			if (handle->get(c))
+			{
+				lua_pushlstring(L, &c, 1);
+			}
+			else
+			{
+				lua_pushnil(L);
+			}
 			return 1;
 		}
 		else
@@ -385,34 +399,22 @@ namespace File
 
 			auto bytesRead = handle->gcount();
 
-			if (bytesRead <= 0)
+			if (bytesRead > 0)
 			{
-				lua_pop(L, -1);
-				luaL_error(L, "zero bytes read");
+				lua_pushlstring(L, buffer.data(), (size_t)bytesRead);
 			}
-
-			lua_pushlstring(L, buffer.data(), (size_t)bytesRead);
+			else
+			{
+				lua_pushnil(L);
+			}
 			return 1;
 		}
 	}
 
 	static int Readln(lua_State* L)
 	{
-		std::fstream* handle = (std::fstream*)lua_touserdata(L, 1);
-
-#ifdef _DEBUG
-		if (!lua_isuserdata(L, 1))
-		{
-			lua_pop(L, -1);
-			luaL_error(L, "not userdata");
-		}
-
-		if (!handle->is_open())
-		{
-			lua_pop(L, -1);
-			luaL_error(L, "not open");
-		}
-#endif
+		std::fstream* handle = (std::fstream*)luaL_checkudata(L, 1, "FileMetatable");
+		if (!handle->is_open()) return luaL_error(L, "bzfile Error: file is not open");
 
 		if (handle->eof())
 		{
@@ -421,48 +423,45 @@ namespace File
 		}
 
 		std::string line;
-		std::getline(*handle, line);
-
-		lua_pushstring(L, line.c_str());
+		if (std::getline(*handle, line))
+		{
+			lua_pushstring(L, line.c_str());
+		}
+		else
+		{
+			lua_pushnil(L);
+		}
 		return 1;
 	}
 
 	static int Dump(lua_State* L)
 	{
-		std::fstream* handle = (std::fstream*)lua_touserdata(L, 1);
-
-#ifdef _DEBUG
-		if (!lua_isuserdata(L, 1))
-		{
-			lua_pop(L, -1);
-			luaL_error(L, "not userdata");
-		}
-
-		if (!handle->is_open())
-		{
-			lua_pop(L, -1);
-			luaL_error(L, "not open");
-		}
-#endif
+		std::fstream* handle = (std::fstream*)luaL_checkudata(L, 1, "FileMetatable");
+		if (!handle->is_open()) return luaL_error(L, "bzfile Error: file is not open");
 
 		handle->clear();
+		handle->seekg(0, std::ios::end);
+		auto size = handle->tellg();
 		handle->seekg(0, std::ios::beg);
 
-		std::string content;
-		std::string line;
-
-		while (std::getline(*handle, line))
+		if (size < 0)
 		{
-			content += line + '\n';
+			lua_pushstring(L, "");
+			return 1;
 		}
 
-		lua_pushstring(L, content.c_str());
+		std::string content;
+		content.resize(static_cast<size_t>(size));
+		handle->read(content.data(), size);
+
+		lua_pushlstring(L, content.data(), content.size());
 		return 1;
 	}
 
 	static int Flush(lua_State* L)
 	{
-		std::fstream* handle = (std::fstream*)lua_touserdata(L, 1);
+		std::fstream* handle = (std::fstream*)luaL_checkudata(L, 1, "FileMetatable");
+		if (!handle->is_open()) return luaL_error(L, "bzfile Error: file is not open");
 		handle->flush();
 
 		lua_pushvalue(L, 1);
@@ -472,8 +471,11 @@ namespace File
 	// This will make the file handle nil in lua
 	static int Close(lua_State* L)
 	{
-		std::fstream* handle = (std::fstream*)lua_touserdata(L, 1);
-		handle->close();
+		std::fstream* handle = (std::fstream*)luaL_checkudata(L, 1, "FileMetatable");
+		if (handle->is_open())
+		{
+			handle->close();
+		}
 		return 0;
 	}
 
@@ -491,30 +493,31 @@ namespace File
 
 	static int MakeDirectory(lua_State* L)
 	{
-		const char* directory = luaL_checkstring(L, 1);
-		std::filesystem::create_directories(CheckWritePathAllowed(L, directory));
+		std::filesystem::path directory = CheckPathAllowed(L, luaL_checkstring(L, 1));
+		std::error_code error;
+		std::filesystem::create_directories(directory, error);
+		if (error)
+		{
+			return luaL_error(L, "bzfile Error: MakeDirectory failed: %s", error.message().c_str());
+		}
 		return 0;
 	}
 
 	static int Exists(lua_State* L)
 	{
-		const char* filePath = luaL_checkstring(L, 1);
+		std::filesystem::path filePath = CheckPathAllowed(L, luaL_checkstring(L, 1));
 		std::error_code error;
-		auto normalizedPath = NormalizePath(filePath);
-		bool exists = std::filesystem::exists(normalizedPath, error);
+		bool exists = std::filesystem::exists(filePath, error);
 
 		lua_pushboolean(L, !error && exists);
 		return 1;
 	}
 
-		static int CopyFile(lua_State* L)
-		{
-			const char* sourcePath = luaL_checkstring(L, 1);
-			const char* destinationPath = luaL_checkstring(L, 2);
-			bool overwriteExisting = lua_toboolean(L, 3) != 0;
-
-			auto normalizedSource = NormalizePath(sourcePath);
-			auto normalizedDestination = CheckWritePathAllowed(L, destinationPath);
+	static int CopyFile(lua_State* L)
+	{
+		std::filesystem::path sourcePath = CheckPathAllowed(L, luaL_checkstring(L, 1));
+		std::filesystem::path destinationPath = CheckPathAllowed(L, luaL_checkstring(L, 2));
+		bool overwriteExisting = lua_toboolean(L, 3) != 0;
 
 			std::error_code error;
 			auto copyOptions = overwriteExisting
@@ -555,11 +558,8 @@ namespace File
 
 	static int ReplaceFileOnExit(lua_State* L)
 	{
-		const char* sourcePath = luaL_checkstring(L, 1);
-		const char* destinationPath = luaL_checkstring(L, 2);
-
-		auto normalizedSource = NormalizePath(sourcePath);
-		auto normalizedDestination = CheckWritePathAllowed(L, destinationPath);
+		std::filesystem::path sourcePath = CheckPathAllowed(L, luaL_checkstring(L, 1));
+		std::filesystem::path destinationPath = CheckPathAllowed(L, luaL_checkstring(L, 2));
 		auto stagedPath = normalizedDestination;
 		stagedPath += ".pending";
 
@@ -629,11 +629,25 @@ namespace File
 		return 1;
 	}
 
+	namespace
+	{
+		struct CryptProvider
+		{
+			HCRYPTPROV handle = 0;
+			~CryptProvider() { if (handle) CryptReleaseContext(handle, 0); }
+		};
+
+		struct CryptHash
+		{
+			HCRYPTHASH handle = 0;
+			~CryptHash() { if (handle) CryptDestroyHash(handle); }
+		};
+	}
+
 	static int GetFileHash(lua_State* L)
 	{
-		const char* filePath = luaL_checkstring(L, 1);
+		std::filesystem::path filePath = CheckPathAllowed(L, luaL_checkstring(L, 1));
 		const char* algorithm = luaL_optstring(L, 2, "sha256");
-		auto normalizedPath = NormalizePath(filePath);
 
 		ALG_ID algorithmId = 0;
 		if (_stricmp(algorithm, "sha256") == 0)
@@ -646,28 +660,27 @@ namespace File
 			return 0;
 		}
 
-		std::ifstream input(normalizedPath, std::ios::binary);
+		std::ifstream input(filePath, std::ios::binary);
 		if (!input.is_open())
 		{
 			lua_pushnil(L);
-			lua_pushfstring(L, "could not open \"%s\"", normalizedPath.string().c_str());
+			lua_pushfstring(L, "bzfile Error: could not open \"%s\"", filePath.string().c_str());
 			return 2;
 		}
 
-		HCRYPTPROV provider = 0;
-		HCRYPTHASH hashHandle = 0;
-		if (!CryptAcquireContext(&provider, nullptr, nullptr, PROV_RSA_AES, CRYPT_VERIFYCONTEXT))
+		CryptProvider provider;
+		if (!CryptAcquireContext(&provider.handle, nullptr, nullptr, PROV_RSA_AES, CRYPT_VERIFYCONTEXT))
 		{
 			lua_pushnil(L);
-			lua_pushstring(L, "CryptAcquireContext failed");
+			lua_pushstring(L, "bzfile Error: CryptAcquireContext failed");
 			return 2;
 		}
 
-		if (!CryptCreateHash(provider, algorithmId, 0, 0, &hashHandle))
+		CryptHash hash;
+		if (!CryptCreateHash(provider.handle, algorithmId, 0, 0, &hash.handle))
 		{
-			CryptReleaseContext(provider, 0);
 			lua_pushnil(L);
-			lua_pushstring(L, "CryptCreateHash failed");
+			lua_pushstring(L, "bzfile Error: CryptCreateHash failed");
 			return 2;
 		}
 
@@ -681,39 +694,30 @@ namespace File
 				break;
 			}
 
-			if (!CryptHashData(hashHandle, reinterpret_cast<const BYTE*>(buffer.data()), static_cast<DWORD>(bytesRead), 0))
+			if (!CryptHashData(hash.handle, reinterpret_cast<const BYTE*>(buffer.data()), static_cast<DWORD>(bytesRead), 0))
 			{
-				CryptDestroyHash(hashHandle);
-				CryptReleaseContext(provider, 0);
 				lua_pushnil(L);
-				lua_pushstring(L, "CryptHashData failed");
+				lua_pushstring(L, "bzfile Error: CryptHashData failed");
 				return 2;
 			}
 		}
 
 		DWORD hashLength = 0;
 		DWORD hashLengthSize = sizeof(hashLength);
-		if (!CryptGetHashParam(hashHandle, HP_HASHSIZE, reinterpret_cast<BYTE*>(&hashLength), &hashLengthSize, 0))
+		if (!CryptGetHashParam(hash.handle, HP_HASHSIZE, reinterpret_cast<BYTE*>(&hashLength), &hashLengthSize, 0))
 		{
-			CryptDestroyHash(hashHandle);
-			CryptReleaseContext(provider, 0);
 			lua_pushnil(L);
-			lua_pushstring(L, "CryptGetHashParam(size) failed");
+			lua_pushstring(L, "bzfile Error: CryptGetHashParam(size) failed");
 			return 2;
 		}
 
 		std::vector<BYTE> hashBytes(hashLength);
-		if (!CryptGetHashParam(hashHandle, HP_HASHVAL, hashBytes.data(), &hashLength, 0))
+		if (!CryptGetHashParam(hash.handle, HP_HASHVAL, hashBytes.data(), &hashLength, 0))
 		{
-			CryptDestroyHash(hashHandle);
-			CryptReleaseContext(provider, 0);
 			lua_pushnil(L);
-			lua_pushstring(L, "CryptGetHashParam(value) failed");
+			lua_pushstring(L, "bzfile Error: CryptGetHashParam(value) failed");
 			return 2;
 		}
-
-		CryptDestroyHash(hashHandle);
-		CryptReleaseContext(provider, 0);
 
 		std::ostringstream hex;
 		hex << std::hex << std::setfill('0');
@@ -723,6 +727,50 @@ namespace File
 		}
 
 		lua_pushstring(L, hex.str().c_str());
+		return 1;
+	}
+
+	static int Delete(lua_State* L)
+	{
+		std::filesystem::path path = CheckPathAllowed(L, luaL_checkstring(L, 1));
+		std::error_code error;
+		bool deleted = std::filesystem::remove_all(path, error) > 0;
+		lua_pushboolean(L, !error && deleted);
+		if (error)
+		{
+			lua_pushstring(L, error.message().c_str());
+			return 2;
+		}
+		return 1;
+	}
+
+	static int ListDirectory(lua_State* L)
+	{
+		std::filesystem::path path = CheckPathAllowed(L, luaL_checkstring(L, 1));
+		std::error_code error;
+		if (!std::filesystem::is_directory(path, error))
+		{
+			lua_pushnil(L);
+			lua_pushfstring(L, "bzfile Error: not a directory or does not exist: \"%s\"", path.string().c_str());
+			return 2;
+		}
+
+		lua_newtable(L);
+		int index = 1;
+		for (const auto& entry : std::filesystem::directory_iterator(path, error))
+		{
+			lua_pushstring(L, entry.path().filename().string().c_str());
+			lua_rawseti(L, -2, index++);
+		}
+
+		if (error)
+		{
+			lua_pop(L, 1); // remove table
+			lua_pushnil(L);
+			lua_pushstring(L, error.message().c_str());
+			return 2;
+		}
+
 		return 1;
 	}
 }
@@ -781,6 +829,8 @@ extern "C" int __declspec(dllexport) luaopen_bzfile(lua_State* L)
 		{ "CopyFile", &File::CopyFile },
 		{ "ReplaceFileOnExit", &File::ReplaceFileOnExit },
 		{ "GetFileHash", &File::GetFileHash },
+		{ "Delete", &File::Delete },
+		{ "ListDirectory", &File::ListDirectory },
 		{0, 0}
 	};
 
