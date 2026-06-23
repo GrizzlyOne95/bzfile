@@ -19,7 +19,7 @@ jobs:
       uses: microsoft/setup-msbuild@v2
 
     - name: Build
-      run: msbuild bzfile.sln /p:Configuration=Release /p:Platform=Win32
+      run: msbuild bzfile.sln /p:Configuration=Release /p:Platform=x86
 
     - name: Upload bzfile.dll
       uses: actions/upload-artifact@v4
