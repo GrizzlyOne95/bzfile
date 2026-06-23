@@ -214,6 +214,22 @@ namespace File
 			}
 		}
 
+		bool IsWriteProtected(const std::filesystem::path& path)
+		{
+			if (g_AllowWinmmOverwrite)
+			{
+				return false;
+			}
+
+			auto fileName = ToLower(path.filename().wstring());
+			if (fileName == L"winmm.dll" || fileName == L"bzfile.dll")
+			{
+				return true;
+			}
+
+			return false;
+		}
+
 		std::string NarrowSystemError(DWORD errorCode)
 		{
 			std::error_code error(static_cast<int>(errorCode), std::system_category());
@@ -298,6 +314,11 @@ namespace File
 
 		if (isWrite)
 		{
+			if (IsWriteProtected(filePath))
+			{
+				return luaL_error(L, "bzfile Error: file is write-protected: \"%s\"", filePath.string().c_str());
+			}
+
 			if (options == "app")
 			{
 				openMode |= std::ios::app;
@@ -520,6 +541,14 @@ namespace File
 	{
 		std::filesystem::path sourcePath = CheckPathAllowed(L, luaL_checkstring(L, 1));
 		std::filesystem::path destinationPath = CheckPathAllowed(L, luaL_checkstring(L, 2));
+
+		if (IsWriteProtected(destinationPath))
+		{
+			lua_pushboolean(L, 0);
+			lua_pushfstring(L, "bzfile Error: destination is write-protected: \"%s\"", destinationPath.string().c_str());
+			return 2;
+		}
+
 		bool overwriteExisting = lua_toboolean(L, 3) != 0;
 
 		std::error_code error;
@@ -564,10 +593,10 @@ namespace File
 		std::filesystem::path sourcePath = CheckPathAllowed(L, luaL_checkstring(L, 1));
 		std::filesystem::path destinationPath = CheckPathAllowed(L, luaL_checkstring(L, 2));
 
-		if (!g_AllowWinmmOverwrite && ToLower(destinationPath.filename().wstring()) == L"winmm.dll")
+		if (IsWriteProtected(destinationPath))
 		{
 			lua_pushboolean(L, 0);
-			lua_pushstring(L, "bzfile Error: winmm.dll overwrite is disabled");
+			lua_pushfstring(L, "bzfile Error: destination is write-protected: \"%s\"", destinationPath.string().c_str());
 			return 2;
 		}
 
@@ -744,6 +773,14 @@ namespace File
 	static int Delete(lua_State* L)
 	{
 		std::filesystem::path path = CheckPathAllowed(L, luaL_checkstring(L, 1));
+
+		if (IsWriteProtected(path))
+		{
+			lua_pushboolean(L, 0);
+			lua_pushfstring(L, "bzfile Error: path is write-protected: \"%s\"", path.string().c_str());
+			return 2;
+		}
+
 		std::error_code error;
 		bool deleted = std::filesystem::remove_all(path, error) > 0;
 		lua_pushboolean(L, !error && deleted);
