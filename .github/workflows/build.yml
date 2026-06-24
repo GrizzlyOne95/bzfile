@@ -21,6 +21,9 @@ jobs:
     - name: Build
       run: msbuild bzfile.sln /p:Configuration=Release /p:Platform=x86
 
+    - name: List Files
+      run: Get-ChildItem -Recurse
+
     - name: Upload bzfile.dll
       uses: actions/upload-artifact@v4
       with:
@@ -35,7 +38,7 @@ jobs:
 
   release:
     needs: build
-    if: startsWith(github.ref, 'refs/tags/v')
+    if: github.event_name == 'workflow_dispatch' || (github.event_name == 'push' && (github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/tags/v')))
     runs-on: ubuntu-latest
     permissions:
       contents: write
@@ -48,13 +51,17 @@ jobs:
     - name: Package Release
       run: |
         mkdir release
-        cp artifacts/bzfile-dll/bzfile.dll release/
-        cp artifacts/bzfile-replace-helper/bzfile_replace_helper.exe release/
+        # Use find to be more flexible with artifact structure if it changed in v4
+        find artifacts -name "bzfile.dll" -exec cp {} release/ \;
+        find artifacts -name "bzfile_replace_helper.exe" -exec cp {} release/ \;
         cd release
         zip -r ../bzfile-release.zip .
 
     - name: Create Release
       uses: softprops/action-gh-release@v2
       with:
+        tag_name: ${{ startsWith(github.ref, 'refs/tags/v') && github.ref_name || 'latest' }}
+        name: ${{ startsWith(github.ref, 'refs/tags/v') && github.ref_name || 'Latest Build' }}
         files: bzfile-release.zip
         generate_release_notes: true
+        make_latest: ${{ startsWith(github.ref, 'refs/tags/v') }}
