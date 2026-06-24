@@ -22,7 +22,7 @@ jobs:
       run: msbuild bzfile.sln /p:Configuration=Release /p:Platform=x86
 
     - name: List Files
-      run: dir /s
+      run: Get-ChildItem -Recurse
 
     - name: Upload bzfile.dll
       uses: actions/upload-artifact@v4
