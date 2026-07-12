@@ -263,7 +263,10 @@ namespace File
 				nullptr,
 				nullptr,
 				FALSE,
-				CREATE_NO_WINDOW | DETACHED_PROCESS,
+				// GOG Galaxy can place the game and its children in a job object.
+				// Without breakaway, the replacement helper is terminated with the
+				// game before it can promote the pending DLL.
+				CREATE_NO_WINDOW | DETACHED_PROCESS | CREATE_BREAKAWAY_FROM_JOB,
 				nullptr,
 				nullptr,
 				&startupInfo,
@@ -677,58 +680,40 @@ namespace File
 			~CryptProvider() { if (handle) CryptReleaseContext(handle, 0); }
 		};
 
-		struct CryptHash
-		{
-			HCRYPTHASH handle = 0;
-			~CryptHash() { if (handle) CryptDestroyHash(handle); }
-		};
-	}
-
-	static int GetFileHash(lua_State* L)
+	struct CryptHash
 	{
-		std::filesystem::path filePath = CheckPathAllowed(L, luaL_checkstring(L, 1));
-		const char* algorithm = luaL_optstring(L, 2, "sha256");
+		HCRYPTHASH handle = 0;
+		~CryptHash() { if (handle) CryptDestroyHash(handle); }
+	};
 
-		ALG_ID algorithmId = 0;
-		if (_stricmp(algorithm, "sha256") == 0)
-		{
-			algorithmId = CALG_SHA_256;
-		}
-		else
-		{
-			luaL_error(L, "bzfile Error: unsupported hash algorithm \"%s\"", algorithm);
-			return 0;
-		}
-
+	bool ComputeSha256(const std::filesystem::path& filePath, std::string& result, std::string& errorMessage)
+	{
 		std::ifstream input(filePath, std::ios::binary);
 		if (!input.is_open())
 		{
-			lua_pushnil(L);
-			lua_pushfstring(L, "bzfile Error: could not open \"%s\"", filePath.string().c_str());
-			return 2;
+			errorMessage = "could not open file";
+			return false;
 		}
 
 		CryptProvider provider;
 		if (!CryptAcquireContext(&provider.handle, nullptr, nullptr, PROV_RSA_AES, CRYPT_VERIFYCONTEXT))
 		{
-			lua_pushnil(L);
-			lua_pushstring(L, "bzfile Error: CryptAcquireContext failed");
-			return 2;
+			errorMessage = "CryptAcquireContext failed";
+			return false;
 		}
 
 		CryptHash hash;
-		if (!CryptCreateHash(provider.handle, algorithmId, 0, 0, &hash.handle))
+		if (!CryptCreateHash(provider.handle, CALG_SHA_256, 0, 0, &hash.handle))
 		{
-			lua_pushnil(L);
-			lua_pushstring(L, "bzfile Error: CryptCreateHash failed");
-			return 2;
+			errorMessage = "CryptCreateHash failed";
+			return false;
 		}
 
 		std::vector<char> buffer(64 * 1024);
 		while (input.good())
 		{
 			input.read(buffer.data(), static_cast<std::streamsize>(buffer.size()));
-			auto bytesRead = input.gcount();
+			const auto bytesRead = input.gcount();
 			if (bytesRead <= 0)
 			{
 				break;
@@ -736,9 +721,8 @@ namespace File
 
 			if (!CryptHashData(hash.handle, reinterpret_cast<const BYTE*>(buffer.data()), static_cast<DWORD>(bytesRead), 0))
 			{
-				lua_pushnil(L);
-				lua_pushstring(L, "bzfile Error: CryptHashData failed");
-				return 2;
+				errorMessage = "CryptHashData failed";
+				return false;
 			}
 		}
 
@@ -746,17 +730,15 @@ namespace File
 		DWORD hashLengthSize = sizeof(hashLength);
 		if (!CryptGetHashParam(hash.handle, HP_HASHSIZE, reinterpret_cast<BYTE*>(&hashLength), &hashLengthSize, 0))
 		{
-			lua_pushnil(L);
-			lua_pushstring(L, "bzfile Error: CryptGetHashParam(size) failed");
-			return 2;
+			errorMessage = "CryptGetHashParam(size) failed";
+			return false;
 		}
 
 		std::vector<BYTE> hashBytes(hashLength);
 		if (!CryptGetHashParam(hash.handle, HP_HASHVAL, hashBytes.data(), &hashLength, 0))
 		{
-			lua_pushnil(L);
-			lua_pushstring(L, "bzfile Error: CryptGetHashParam(value) failed");
-			return 2;
+			errorMessage = "CryptGetHashParam(value) failed";
+			return false;
 		}
 
 		std::ostringstream hex;
@@ -766,8 +748,255 @@ namespace File
 			hex << std::setw(2) << static_cast<unsigned int>(value);
 		}
 
-		lua_pushstring(L, hex.str().c_str());
+		result = hex.str();
+		return true;
+	}
+
+	bool IsSha256(const std::string& value)
+	{
+		if (value.size() != 64)
+		{
+			return false;
+		}
+
+		for (const unsigned char valueCharacter : value)
+		{
+			if (!std::isxdigit(valueCharacter))
+			{
+				return false;
+			}
+		}
+
+		return true;
+	}
+
+	bool IsX86PortableExecutable(const std::filesystem::path& filePath, std::string& errorMessage)
+	{
+		std::ifstream input(filePath, std::ios::binary);
+		if (!input.is_open())
+		{
+			errorMessage = "could not open PE file";
+			return false;
+		}
+
+		IMAGE_DOS_HEADER dosHeader = {};
+		input.read(reinterpret_cast<char*>(&dosHeader), sizeof(dosHeader));
+		if (!input || dosHeader.e_magic != IMAGE_DOS_SIGNATURE || dosHeader.e_lfanew <= 0)
+		{
+			errorMessage = "invalid DOS header";
+			return false;
+		}
+
+		input.seekg(dosHeader.e_lfanew, std::ios::beg);
+		DWORD signature = 0;
+		IMAGE_FILE_HEADER fileHeader = {};
+		input.read(reinterpret_cast<char*>(&signature), sizeof(signature));
+		input.read(reinterpret_cast<char*>(&fileHeader), sizeof(fileHeader));
+		if (!input || signature != IMAGE_NT_SIGNATURE)
+		{
+			errorMessage = "invalid PE signature";
+			return false;
+		}
+
+		if (fileHeader.Machine != IMAGE_FILE_MACHINE_I386)
+		{
+			errorMessage = "OpenShim payload is not an x86 PE image";
+			return false;
+		}
+
+		if ((fileHeader.Characteristics & IMAGE_FILE_DLL) == 0)
+		{
+			errorMessage = "OpenShim payload is not a DLL";
+			return false;
+		}
+
+		return true;
+	}
+
+	bool SamePath(const std::filesystem::path& left, const std::filesystem::path& right)
+	{
+		return ToLower(NormalizePath(left).wstring()) == ToLower(NormalizePath(right).wstring());
+	}
+	}
+
+	static int GetFileHash(lua_State* L)
+	{
+		std::filesystem::path filePath = CheckPathAllowed(L, luaL_checkstring(L, 1));
+		const char* algorithm = luaL_optstring(L, 2, "sha256");
+
+		if (_stricmp(algorithm, "sha256") != 0)
+		{
+			luaL_error(L, "bzfile Error: unsupported hash algorithm \"%s\"", algorithm);
+			return 0;
+		}
+
+		std::string hashValue;
+		std::string errorMessage;
+		if (!ComputeSha256(filePath, hashValue, errorMessage))
+		{
+			lua_pushnil(L);
+			lua_pushfstring(L, "bzfile Error: %s: \"%s\"", errorMessage.c_str(), filePath.string().c_str());
+			return 2;
+		}
+
+		lua_pushstring(L, hashValue.c_str());
 		return 1;
+	}
+
+	static int GetFileVersion(lua_State* L)
+	{
+		const std::filesystem::path filePath = CheckPathAllowed(L, luaL_checkstring(L, 1));
+		DWORD ignored = 0;
+		const DWORD versionInfoSize = GetFileVersionInfoSizeW(filePath.c_str(), &ignored);
+		if (versionInfoSize == 0)
+		{
+			lua_pushnil(L);
+			lua_pushstring(L, "bzfile Error: file has no readable version information");
+			return 2;
+		}
+
+		std::vector<BYTE> versionInfo(versionInfoSize);
+		if (!GetFileVersionInfoW(filePath.c_str(), 0, versionInfoSize, versionInfo.data()))
+		{
+			lua_pushnil(L);
+			lua_pushstring(L, "bzfile Error: GetFileVersionInfo failed");
+			return 2;
+		}
+
+		VS_FIXEDFILEINFO* fixedInfo = nullptr;
+		UINT fixedInfoSize = 0;
+		if (!VerQueryValueW(versionInfo.data(), L"\\", reinterpret_cast<void**>(&fixedInfo), &fixedInfoSize)
+			|| fixedInfo == nullptr
+			|| fixedInfoSize < sizeof(VS_FIXEDFILEINFO)
+			|| fixedInfo->dwSignature != VS_FFI_SIGNATURE)
+		{
+			lua_pushnil(L);
+			lua_pushstring(L, "bzfile Error: invalid fixed file version information");
+			return 2;
+		}
+
+		std::ostringstream version;
+		version
+			<< HIWORD(fixedInfo->dwFileVersionMS) << '.'
+			<< LOWORD(fixedInfo->dwFileVersionMS) << '.'
+			<< HIWORD(fixedInfo->dwFileVersionLS) << '.'
+			<< LOWORD(fixedInfo->dwFileVersionLS);
+		lua_pushstring(L, version.str().c_str());
+		return 1;
+	}
+
+	static int StageOpenShimUpdate(lua_State* L)
+	{
+		const std::filesystem::path sourcePath = CheckPathAllowed(L, luaL_checkstring(L, 1));
+		std::string expectedHash = luaL_checkstring(L, 2);
+		for (char& hashCharacter : expectedHash)
+		{
+			hashCharacter = static_cast<char>(std::tolower(static_cast<unsigned char>(hashCharacter)));
+		}
+
+		if (!IsSha256(expectedHash))
+		{
+			lua_pushboolean(L, 0);
+			lua_pushstring(L, "invalid expected SHA-256");
+			return 2;
+		}
+
+		const std::filesystem::path modulePath = GetCurrentModulePath();
+		if (modulePath.empty())
+		{
+			lua_pushboolean(L, 0);
+			lua_pushstring(L, "could not resolve bzfile module path");
+			return 2;
+		}
+
+		const std::filesystem::path moduleDirectory = NormalizePath(modulePath.parent_path());
+		if (ToLower(moduleDirectory.filename().wstring()) != L"3686673790")
+		{
+			lua_pushboolean(L, 0);
+			lua_pushstring(L, "OpenShim staging is restricted to Workshop item 3686673790");
+			return 2;
+		}
+
+		if (!SamePath(sourcePath.parent_path(), moduleDirectory)
+			|| ToLower(sourcePath.filename().wstring()) != L"winmm.dll")
+		{
+			lua_pushboolean(L, 0);
+			lua_pushstring(L, "OpenShim source must be winmm.dll beside the loaded bzfile.dll");
+			return 2;
+		}
+
+		std::string sourceHash;
+		std::string validationError;
+		if (!ComputeSha256(sourcePath, sourceHash, validationError) || sourceHash != expectedHash)
+		{
+			lua_pushboolean(L, 0);
+			lua_pushfstring(L, "OpenShim source hash validation failed: %s", validationError.empty() ? "hash mismatch" : validationError.c_str());
+			return 2;
+		}
+
+		if (!IsX86PortableExecutable(sourcePath, validationError))
+		{
+			lua_pushboolean(L, 0);
+			lua_pushfstring(L, "OpenShim PE validation failed: %s", validationError.c_str());
+			return 2;
+		}
+
+		const std::filesystem::path destinationPath = GetWorkingDirectoryPath() / L"winmm.dll";
+		const std::wstring hashPrefix(expectedHash.begin(), expectedHash.begin() + 12);
+		const std::filesystem::path stagedPath = moduleDirectory / (L"winmm.dll.pending." + hashPrefix);
+		const std::filesystem::path helperPath = moduleDirectory / L"bzfile_replace_helper.exe";
+		const std::filesystem::path logPath = destinationPath.parent_path() / L"winmm_replace.log";
+		const std::filesystem::path backupPath = destinationPath.parent_path() / L"winmm.dll.previous";
+		const std::filesystem::path statusPath = destinationPath.parent_path() / L"winmm_update.status";
+
+		std::error_code error;
+		if (!std::filesystem::exists(helperPath, error))
+		{
+			lua_pushboolean(L, 0);
+			lua_pushstring(L, "bzfile_replace_helper.exe is missing beside bzfile.dll");
+			return 2;
+		}
+
+		error.clear();
+		std::filesystem::copy_file(sourcePath, stagedPath, std::filesystem::copy_options::overwrite_existing, error);
+		if (error)
+		{
+			lua_pushboolean(L, 0);
+			lua_pushfstring(L, "could not stage OpenShim payload: %s", error.message().c_str());
+			return 2;
+		}
+
+		std::vector<std::wstring> arguments = {
+			std::to_wstring(GetCurrentProcessId()),
+			stagedPath.wstring(),
+			destinationPath.wstring(),
+			logPath.wstring(),
+			std::wstring(expectedHash.begin(), expectedHash.end()),
+			backupPath.wstring(),
+			statusPath.wstring()
+		};
+
+		{
+			std::ofstream status(statusPath, std::ios::trunc);
+			if (status.is_open())
+			{
+				status << "state=staged\nexpected_sha256=" << expectedHash << "\n";
+			}
+		}
+
+		std::string launchError;
+		if (!LaunchHiddenProcess(helperPath.wstring(), arguments, launchError))
+		{
+			std::filesystem::remove(stagedPath, error);
+			lua_pushboolean(L, 0);
+			lua_pushfstring(L, "could not launch OpenShim update helper: %s", launchError.c_str());
+			return 2;
+		}
+
+		lua_pushboolean(L, 1);
+		lua_pushstring(L, "staged");
+		lua_pushstring(L, logPath.string().c_str());
+		return 3;
 	}
 
 	static int Delete(lua_State* L)
@@ -889,6 +1118,8 @@ extern "C" int __declspec(dllexport) luaopen_bzfile(lua_State* L)
 		{ "CopyFile", &File::CopyFile },
 		{ "ReplaceFileOnExit", &File::ReplaceFileOnExit },
 		{ "GetFileHash", &File::GetFileHash },
+		{ "GetFileVersion", &File::GetFileVersion },
+		{ "StageOpenShimUpdate", &File::StageOpenShimUpdate },
 		{ "Delete", &File::Delete },
 		{ "ListDirectory", &File::ListDirectory },
 		{ "SetAllowWinmmOverwrite", &File::SetAllowWinmmOverwrite },

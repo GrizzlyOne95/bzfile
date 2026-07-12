@@ -143,3 +143,21 @@ runs.
 bzfile.GetFileHash(path: string, algorithm: string?) -> hash: string, errorMessage?: string
 ```
 Returns a lowercase hex file hash. Currently `sha256` is supported.
+
+```lua
+bzfile.GetFileVersion(path: string) -> version: string, errorMessage?: string
+```
+Returns the fixed Windows file version (for example `1.0.0.5`) from a PE file.
+
+```lua
+bzfile.StageOpenShimUpdate(sourcePath: string, expectedSha256: string)
+    -> success: boolean, stateOrError: string, helperLogPath?: string
+```
+Validates and stages a constrained OpenShim update. Unlike the generic file APIs,
+the script cannot choose the destination: it is always `winmm.dll` in the game
+root. The source must be an x86 DLL named `winmm.dll` beside the loaded
+`bzfile.dll`, and its SHA-256 must match `expectedSha256`. The hidden helper waits
+for Battlezone to exit, backs up the previous shim, atomically promotes the
+payload, verifies the installed hash, and rolls back on verification failure.
+Progress is written to `winmm_update.status` and details to
+`winmm_replace.log` in the game root.

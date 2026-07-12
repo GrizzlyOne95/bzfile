@@ -1,8 +1,10 @@
 #include <Windows.h>
 #include <shellapi.h>
+#include <wincrypt.h>
 
 #include <cstdlib>
 #include <filesystem>
+#include <fstream>
 #include <string>
 #include <sstream>
 #include <vector>
@@ -10,6 +12,24 @@
 
 namespace
 {
+	struct CryptProvider
+	{
+		HCRYPTPROV handle = 0;
+		~CryptProvider() { if (handle) CryptReleaseContext(handle, 0); }
+	};
+
+	struct CryptHash
+	{
+		HCRYPTHASH handle = 0;
+		~CryptHash() { if (handle) CryptDestroyHash(handle); }
+	};
+
+	struct ScopedHandle
+	{
+		HANDLE handle = nullptr;
+		~ScopedHandle() { if (handle != nullptr) CloseHandle(handle); }
+	};
+
 	std::string Utf8FromWide(const std::wstring& value)
 	{
 		if (value.empty())
@@ -111,6 +131,134 @@ namespace
 		CloseHandle(handle);
 	}
 
+	void WriteStatus(
+		const std::filesystem::path& statusPath,
+		const std::wstring& state,
+		const std::wstring& expectedHash,
+		const std::wstring& detail)
+	{
+		if (statusPath.empty())
+		{
+			return;
+		}
+
+		const std::wstring content =
+			L"state=" + state + L"\r\n" +
+			L"expected_sha256=" + expectedHash + L"\r\n" +
+			L"detail=" + detail + L"\r\n" +
+			L"updated=" + TimestampNow() + L"\r\n";
+		const std::string utf8 = Utf8FromWide(content);
+		if (utf8.empty())
+		{
+			return;
+		}
+
+		HANDLE handle = CreateFileW(
+			statusPath.c_str(),
+			GENERIC_WRITE,
+			FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+			nullptr,
+			CREATE_ALWAYS,
+			FILE_ATTRIBUTE_NORMAL,
+			nullptr);
+		if (handle == INVALID_HANDLE_VALUE)
+		{
+			return;
+		}
+
+		DWORD bytesWritten = 0;
+		WriteFile(handle, utf8.data(), static_cast<DWORD>(utf8.size()), &bytesWritten, nullptr);
+		CloseHandle(handle);
+	}
+
+	bool ComputeSha256(const std::filesystem::path& filePath, std::wstring& result, std::wstring& errorMessage)
+	{
+		std::ifstream input(filePath, std::ios::binary);
+		if (!input.is_open())
+		{
+			errorMessage = L"could not open file";
+			return false;
+		}
+
+		CryptProvider provider;
+		if (!CryptAcquireContextW(&provider.handle, nullptr, nullptr, PROV_RSA_AES, CRYPT_VERIFYCONTEXT))
+		{
+			errorMessage = L"CryptAcquireContext failed: " + FormatWindowsError(GetLastError());
+			return false;
+		}
+
+		CryptHash hash;
+		if (!CryptCreateHash(provider.handle, CALG_SHA_256, 0, 0, &hash.handle))
+		{
+			errorMessage = L"CryptCreateHash failed: " + FormatWindowsError(GetLastError());
+			return false;
+		}
+
+		std::vector<char> buffer(64 * 1024);
+		while (input.good())
+		{
+			input.read(buffer.data(), static_cast<std::streamsize>(buffer.size()));
+			const auto bytesRead = input.gcount();
+			if (bytesRead <= 0)
+			{
+				break;
+			}
+
+			if (!CryptHashData(hash.handle, reinterpret_cast<const BYTE*>(buffer.data()), static_cast<DWORD>(bytesRead), 0))
+			{
+				errorMessage = L"CryptHashData failed: " + FormatWindowsError(GetLastError());
+				return false;
+			}
+		}
+
+		DWORD hashLength = 0;
+		DWORD hashLengthSize = sizeof(hashLength);
+		if (!CryptGetHashParam(hash.handle, HP_HASHSIZE, reinterpret_cast<BYTE*>(&hashLength), &hashLengthSize, 0))
+		{
+			errorMessage = L"CryptGetHashParam(size) failed";
+			return false;
+		}
+
+		std::vector<BYTE> hashBytes(hashLength);
+		if (!CryptGetHashParam(hash.handle, HP_HASHVAL, hashBytes.data(), &hashLength, 0))
+		{
+			errorMessage = L"CryptGetHashParam(value) failed";
+			return false;
+		}
+
+		std::wstringstream hex;
+		hex << std::hex << std::setfill(L'0');
+		for (BYTE value : hashBytes)
+		{
+			hex << std::setw(2) << static_cast<unsigned int>(value);
+		}
+		result = hex.str();
+		return true;
+	}
+
+	bool RestoreBackup(
+		const std::filesystem::path& backupPath,
+		const std::filesystem::path& destinationPath,
+		const std::filesystem::path& logPath)
+	{
+		if (backupPath.empty() || !std::filesystem::exists(backupPath))
+		{
+			AppendLogLine(logPath, L"No backup is available for rollback.");
+			return false;
+		}
+
+		SetFileAttributesW(backupPath.c_str(), FILE_ATTRIBUTE_NORMAL);
+		SetFileAttributesW(destinationPath.c_str(), FILE_ATTRIBUTE_NORMAL);
+		if (!CopyFileW(backupPath.c_str(), destinationPath.c_str(), FALSE))
+		{
+			AppendLogLine(logPath, L"Rollback copy failed: " + FormatWindowsError(GetLastError()));
+			return false;
+		}
+
+		AppendLogLine(logPath, L"Restored previous OpenShim backup.");
+		return true;
+	}
+
 	bool WaitForProcessExit(DWORD processId, const std::filesystem::path& logPath)
 	{
 		if (processId == 0)
@@ -207,7 +355,8 @@ int APIENTRY wWinMain(HINSTANCE, HINSTANCE, PWSTR, int)
 	std::vector<std::wstring> arguments(argv, argv + argc);
 	LocalFree(argv);
 
-	if (arguments.size() != 5)
+	const bool hardenedMode = arguments.size() == 8;
+	if (arguments.size() != 5 && !hardenedMode)
 	{
 		return 2;
 	}
@@ -216,6 +365,26 @@ int APIENTRY wWinMain(HINSTANCE, HINSTANCE, PWSTR, int)
 	const std::filesystem::path stagedPath(arguments[2]);
 	const std::filesystem::path destinationPath(arguments[3]);
 	const std::filesystem::path logPath(arguments[4]);
+	const std::wstring expectedHash = hardenedMode ? arguments[5] : L"";
+	const std::filesystem::path backupPath = hardenedMode ? std::filesystem::path(arguments[6]) : std::filesystem::path();
+	const std::filesystem::path statusPath = hardenedMode ? std::filesystem::path(arguments[7]) : std::filesystem::path();
+
+	ScopedHandle updateMutex;
+	if (hardenedMode)
+	{
+		updateMutex.handle = CreateMutexW(nullptr, FALSE, L"Local\\BZR_OpenShim_Update");
+		if (updateMutex.handle == nullptr)
+		{
+			WriteStatus(statusPath, L"failed", expectedHash, L"could not create update mutex");
+			return 1;
+		}
+		if (GetLastError() == ERROR_ALREADY_EXISTS)
+		{
+			AppendLogLine(logPath, L"Another OpenShim update helper is already active.");
+			WriteStatus(statusPath, L"already_staged", expectedHash, L"another helper is active");
+			return 0;
+		}
+	}
 
 	AppendLogLine(logPath, L"bzfile replace helper started.");
 	AppendLogLine(logPath, L"Staged: " + stagedPath.wstring());
@@ -224,15 +393,68 @@ int APIENTRY wWinMain(HINSTANCE, HINSTANCE, PWSTR, int)
 	if (!std::filesystem::exists(stagedPath))
 	{
 		AppendLogLine(logPath, L"Staged file is missing before replacement.");
+		WriteStatus(statusPath, L"failed", expectedHash, L"staged file is missing");
 		return 1;
 	}
 
-	WaitForProcessExit(processId, logPath);
+	if (hardenedMode)
+	{
+		std::wstring stagedHash;
+		std::wstring hashError;
+		if (!ComputeSha256(stagedPath, stagedHash, hashError) || stagedHash != expectedHash)
+		{
+			AppendLogLine(logPath, L"Staged payload hash validation failed: " + hashError);
+			WriteStatus(statusPath, L"failed", expectedHash, L"staged payload hash mismatch");
+			return 1;
+		}
+		AppendLogLine(logPath, L"Staged payload SHA-256 verified: " + stagedHash);
+		WriteStatus(statusPath, L"waiting_for_exit", expectedHash, L"payload verified");
+	}
+
+	if (!WaitForProcessExit(processId, logPath))
+	{
+		WriteStatus(statusPath, L"failed", expectedHash, L"could not wait for game process exit");
+		return 1;
+	}
+
+	if (hardenedMode && std::filesystem::exists(destinationPath))
+	{
+		SetFileAttributesW(destinationPath.c_str(), FILE_ATTRIBUTE_NORMAL);
+		SetFileAttributesW(backupPath.c_str(), FILE_ATTRIBUTE_NORMAL);
+		if (!CopyFileW(destinationPath.c_str(), backupPath.c_str(), FALSE))
+		{
+			const std::wstring backupError = FormatWindowsError(GetLastError());
+			AppendLogLine(logPath, L"Could not create OpenShim backup: " + backupError);
+			WriteStatus(statusPath, L"failed", expectedHash, L"could not create backup: " + backupError);
+			return 1;
+		}
+		AppendLogLine(logPath, L"Backed up current OpenShim to: " + backupPath.wstring());
+	}
 
 	if (!PromoteReplacement(stagedPath, destinationPath, logPath))
 	{
 		AppendLogLine(logPath, L"Replacement failed after retries.");
+		WriteStatus(statusPath, L"failed", expectedHash, L"replacement failed after retries");
 		return 1;
+	}
+
+	if (hardenedMode)
+	{
+		std::wstring destinationHash;
+		std::wstring hashError;
+		if (!ComputeSha256(destinationPath, destinationHash, hashError) || destinationHash != expectedHash)
+		{
+			AppendLogLine(logPath, L"Installed payload hash validation failed: " + hashError);
+			const bool restored = RestoreBackup(backupPath, destinationPath, logPath);
+			WriteStatus(
+				statusPath,
+				L"failed",
+				expectedHash,
+				restored ? L"installed hash mismatch; previous version restored" : L"installed hash mismatch; rollback failed");
+			return 1;
+		}
+		AppendLogLine(logPath, L"Installed OpenShim SHA-256 verified: " + destinationHash);
+		WriteStatus(statusPath, L"complete", expectedHash, L"replacement verified");
 	}
 
 	AppendLogLine(logPath, L"bzfile replace helper completed successfully.");
