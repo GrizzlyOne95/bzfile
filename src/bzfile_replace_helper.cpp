@@ -341,6 +341,164 @@ namespace
 
 		return false;
 	}
+
+	struct SuitePayload
+	{
+		std::filesystem::path stagedPath;
+		std::filesystem::path destinationPath;
+		std::wstring expectedHash;
+		std::filesystem::path backupPath;
+		bool destinationExisted = false;
+	};
+
+	bool RollBackSuite(
+		const std::vector<SuitePayload>& payloads,
+		const std::filesystem::path& logPath)
+	{
+		bool allRestored = true;
+		for (const auto& payload : payloads)
+		{
+			if (payload.destinationExisted)
+			{
+				if (!RestoreBackup(payload.backupPath, payload.destinationPath, logPath))
+				{
+					allRestored = false;
+				}
+			}
+			else
+			{
+				std::error_code removeError;
+				std::filesystem::remove(payload.destinationPath, removeError);
+				if (removeError)
+				{
+					AppendLogLine(logPath, L"Rollback removal failed for " + payload.destinationPath.wstring() + L": " +
+						L"error " + std::to_wstring(removeError.value()));
+					allRestored = false;
+				}
+			}
+		}
+		return allRestored;
+	}
+
+	int RunSuiteUpdate(const std::vector<std::wstring>& arguments)
+	{
+		// executable, --suite, pid, log, status, then three groups of
+		// staged/destination/hash/backup.
+		if (arguments.size() != 17 || arguments[1] != L"--suite")
+		{
+			return 2;
+		}
+
+		const DWORD processId = static_cast<DWORD>(wcstoul(arguments[2].c_str(), nullptr, 10));
+		const std::filesystem::path logPath(arguments[3]);
+		const std::filesystem::path statusPath(arguments[4]);
+		std::vector<SuitePayload> payloads;
+		for (size_t index = 5; index < arguments.size(); index += 4)
+		{
+			payloads.push_back({
+				std::filesystem::path(arguments[index]),
+				std::filesystem::path(arguments[index + 1]),
+				arguments[index + 2],
+				std::filesystem::path(arguments[index + 3]),
+				false
+			});
+		}
+		const std::wstring suiteHash = payloads.front().expectedHash;
+
+		ScopedHandle updateMutex;
+		updateMutex.handle = CreateMutexW(nullptr, FALSE, L"Local\\BZR_OpenShim_Update");
+		if (updateMutex.handle == nullptr)
+		{
+			WriteStatus(statusPath, L"failed", suiteHash, L"could not create update mutex");
+			return 1;
+		}
+		if (GetLastError() == ERROR_ALREADY_EXISTS)
+		{
+			AppendLogLine(logPath, L"Another OpenShim update helper is already active.");
+			WriteStatus(statusPath, L"already_staged", suiteHash, L"another helper is active");
+			return 0;
+		}
+
+		AppendLogLine(logPath, L"OpenShim suite update helper started.");
+		for (const auto& payload : payloads)
+		{
+			AppendLogLine(logPath, L"Validating staged payload: " + payload.stagedPath.wstring());
+			if (!std::filesystem::exists(payload.stagedPath))
+			{
+				WriteStatus(statusPath, L"failed", suiteHash, L"a staged suite payload is missing");
+				return 1;
+			}
+
+			std::wstring stagedHash;
+			std::wstring hashError;
+			if (!ComputeSha256(payload.stagedPath, stagedHash, hashError) || stagedHash != payload.expectedHash)
+			{
+				AppendLogLine(logPath, L"Staged suite payload hash validation failed: " + payload.stagedPath.wstring());
+				WriteStatus(statusPath, L"failed", suiteHash, L"staged suite payload hash mismatch");
+				return 1;
+			}
+		}
+
+		WriteStatus(statusPath, L"waiting_for_exit", suiteHash, L"all suite payloads verified");
+		if (!WaitForProcessExit(processId, logPath))
+		{
+			WriteStatus(statusPath, L"failed", suiteHash, L"could not wait for game process exit");
+			return 1;
+		}
+
+		for (auto& payload : payloads)
+		{
+			std::error_code directoryError;
+			std::filesystem::create_directories(payload.destinationPath.parent_path(), directoryError);
+			if (directoryError)
+			{
+				AppendLogLine(logPath, L"Could not create destination directory for " + payload.destinationPath.wstring());
+				WriteStatus(statusPath, L"failed", suiteHash, L"could not create destination directory");
+				return 1;
+			}
+
+			payload.destinationExisted = std::filesystem::exists(payload.destinationPath);
+			if (payload.destinationExisted)
+			{
+				SetFileAttributesW(payload.destinationPath.c_str(), FILE_ATTRIBUTE_NORMAL);
+				SetFileAttributesW(payload.backupPath.c_str(), FILE_ATTRIBUTE_NORMAL);
+				if (!CopyFileW(payload.destinationPath.c_str(), payload.backupPath.c_str(), FALSE))
+				{
+					const std::wstring backupError = FormatWindowsError(GetLastError());
+					AppendLogLine(logPath, L"Could not back up " + payload.destinationPath.wstring() + L": " + backupError);
+					WriteStatus(statusPath, L"failed", suiteHash, L"could not back up existing suite payload");
+					return 1;
+				}
+			}
+		}
+
+		for (const auto& payload : payloads)
+		{
+			AppendLogLine(logPath, L"Promoting suite payload to: " + payload.destinationPath.wstring());
+			if (!PromoteReplacement(payload.stagedPath, payload.destinationPath, logPath))
+			{
+				const bool restored = RollBackSuite(payloads, logPath);
+				WriteStatus(statusPath, L"failed", suiteHash,
+					restored ? L"suite promotion failed; previous files restored" : L"suite promotion failed; rollback incomplete");
+				return 1;
+			}
+
+			std::wstring destinationHash;
+			std::wstring hashError;
+			if (!ComputeSha256(payload.destinationPath, destinationHash, hashError) || destinationHash != payload.expectedHash)
+			{
+				AppendLogLine(logPath, L"Installed suite payload hash validation failed: " + payload.destinationPath.wstring());
+				const bool restored = RollBackSuite(payloads, logPath);
+				WriteStatus(statusPath, L"failed", suiteHash,
+					restored ? L"installed suite hash mismatch; previous files restored" : L"installed suite hash mismatch; rollback incomplete");
+				return 1;
+			}
+		}
+
+		WriteStatus(statusPath, L"complete", suiteHash, L"all suite payloads installed and verified");
+		AppendLogLine(logPath, L"OpenShim suite update completed successfully.");
+		return 0;
+	}
 }
 
 int APIENTRY wWinMain(HINSTANCE, HINSTANCE, PWSTR, int)
@@ -354,6 +512,10 @@ int APIENTRY wWinMain(HINSTANCE, HINSTANCE, PWSTR, int)
 
 	std::vector<std::wstring> arguments(argv, argv + argc);
 	LocalFree(argv);
+	if (arguments.size() > 1 && arguments[1] == L"--suite")
+	{
+		return RunSuiteUpdate(arguments);
+	}
 
 	const bool hardenedMode = arguments.size() == 8;
 	if (arguments.size() != 5 && !hardenedMode)

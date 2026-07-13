@@ -161,3 +161,20 @@ for Battlezone to exit, backs up the previous shim, atomically promotes the
 payload, verifies the installed hash, and rolls back on verification failure.
 Progress is written to `winmm_update.status` and details to
 `winmm_replace.log` in the game root.
+
+```lua
+bzfile.StageOpenShimSuiteUpdate(
+    winmmSource: string, winmmSha256: string,
+    networkSource: string, networkSha256: string,
+    patchesSource: string, patchesSha256: string)
+    -> success: boolean, stateOrError: string, helperLogPath?: string
+```
+Stages the complete Campaign Reimagined native suite as one verified
+transaction. Sources are restricted to `winmm.dll`,
+`openshim_net.ini.payload`, and `openshim_patches.json.payload` beside the
+loaded `bzfile.dll`; destinations are fixed to the game-root `winmm.dll`,
+`net.ini`, and `scripts/patches.json`. The helper validates every staged hash
+before game exit, backs up all existing destinations, promotes and verifies all
+three payloads, and rolls the suite back if any promotion or verification
+fails. Progress is written to `openshim_update.status` and details to
+`openshim_update.log`.

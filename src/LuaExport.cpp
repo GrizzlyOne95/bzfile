@@ -51,6 +51,15 @@ namespace File
 			return NormalizePath(std::filesystem::current_path());
 		}
 
+		std::filesystem::path GetLogsDirectoryPath()
+		{
+			const auto gameRoot = GetWorkingDirectoryPath();
+			const auto logs = gameRoot / L"logs";
+			std::error_code error;
+			std::filesystem::create_directories(logs, error);
+			return error ? gameRoot : logs;
+		}
+
 		std::filesystem::path FindSteamAppsDirectory(const std::filesystem::path& start)
 		{
 			auto current = NormalizePath(start);
@@ -651,7 +660,7 @@ namespace File
 			logStem = L"bzfile";
 		}
 
-		auto logPath = destinationPath.parent_path() / (logStem + L"_replace.log");
+		auto logPath = GetLogsDirectoryPath() / (logStem + L"_replace.log");
 		std::vector<std::wstring> arguments = {
 			std::to_wstring(currentProcessId),
 			stagedPath.wstring(),
@@ -945,7 +954,7 @@ namespace File
 		const std::wstring hashPrefix(expectedHash.begin(), expectedHash.begin() + 12);
 		const std::filesystem::path stagedPath = moduleDirectory / (L"winmm.dll.pending." + hashPrefix);
 		const std::filesystem::path helperPath = moduleDirectory / L"bzfile_replace_helper.exe";
-		const std::filesystem::path logPath = destinationPath.parent_path() / L"winmm_replace.log";
+		const std::filesystem::path logPath = GetLogsDirectoryPath() / L"winmm_replace.log";
 		const std::filesystem::path backupPath = destinationPath.parent_path() / L"winmm.dll.previous";
 		const std::filesystem::path statusPath = destinationPath.parent_path() / L"winmm_update.status";
 
@@ -990,6 +999,184 @@ namespace File
 			std::filesystem::remove(stagedPath, error);
 			lua_pushboolean(L, 0);
 			lua_pushfstring(L, "could not launch OpenShim update helper: %s", launchError.c_str());
+			return 2;
+		}
+
+		lua_pushboolean(L, 1);
+		lua_pushstring(L, "staged");
+		lua_pushstring(L, logPath.string().c_str());
+		return 3;
+	}
+
+	static int StageOpenShimSuiteUpdate(lua_State* L)
+	{
+		struct Payload
+		{
+			std::filesystem::path source;
+			std::string expectedHash;
+			std::wstring expectedName;
+			std::filesystem::path destination;
+			std::filesystem::path staged;
+			std::filesystem::path backup;
+		};
+
+		const std::filesystem::path modulePath = GetCurrentModulePath();
+		if (modulePath.empty())
+		{
+			lua_pushboolean(L, 0);
+			lua_pushstring(L, "could not resolve bzfile module path");
+			return 2;
+		}
+
+		const std::filesystem::path moduleDirectory = NormalizePath(modulePath.parent_path());
+		if (ToLower(moduleDirectory.filename().wstring()) != L"3686673790")
+		{
+			lua_pushboolean(L, 0);
+			lua_pushstring(L, "OpenShim suite staging is restricted to Workshop item 3686673790");
+			return 2;
+		}
+
+		const std::filesystem::path gameRoot = GetWorkingDirectoryPath();
+		std::vector<Payload> payloads = {
+			{
+				CheckPathAllowed(L, luaL_checkstring(L, 1)),
+				luaL_checkstring(L, 2),
+				L"winmm.dll",
+				gameRoot / L"winmm.dll",
+				{},
+				gameRoot / L"winmm.dll.previous"
+			},
+			{
+				CheckPathAllowed(L, luaL_checkstring(L, 3)),
+				luaL_checkstring(L, 4),
+				L"openshim_net.ini.payload",
+				gameRoot / L"net.ini",
+				{},
+				gameRoot / L"net.ini.previous"
+			},
+			{
+				CheckPathAllowed(L, luaL_checkstring(L, 5)),
+				luaL_checkstring(L, 6),
+				L"openshim_patches.json.payload",
+				gameRoot / L"scripts" / L"patches.json",
+				{},
+				gameRoot / L"scripts" / L"patches.json.previous"
+			}
+		};
+
+		for (size_t index = 0; index < payloads.size(); ++index)
+		{
+			auto& payload = payloads[index];
+			for (char& hashCharacter : payload.expectedHash)
+			{
+				hashCharacter = static_cast<char>(std::tolower(static_cast<unsigned char>(hashCharacter)));
+			}
+
+			if (!IsSha256(payload.expectedHash))
+			{
+				lua_pushboolean(L, 0);
+				lua_pushfstring(L, "invalid expected SHA-256 for suite payload %d", static_cast<int>(index + 1));
+				return 2;
+			}
+
+			if (!SamePath(payload.source.parent_path(), moduleDirectory)
+				|| ToLower(payload.source.filename().wstring()) != payload.expectedName)
+			{
+				lua_pushboolean(L, 0);
+				lua_pushfstring(L, "suite payload %d must be %s beside the loaded bzfile.dll",
+					static_cast<int>(index + 1),
+					payload.source.filename().string().c_str());
+				return 2;
+			}
+
+			std::string sourceHash;
+			std::string validationError;
+			if (!ComputeSha256(payload.source, sourceHash, validationError) || sourceHash != payload.expectedHash)
+			{
+				lua_pushboolean(L, 0);
+				lua_pushfstring(L, "suite payload %d hash validation failed: %s",
+					static_cast<int>(index + 1),
+					validationError.empty() ? "hash mismatch" : validationError.c_str());
+				return 2;
+			}
+
+			if (index == 0 && !IsX86PortableExecutable(payload.source, validationError))
+			{
+				lua_pushboolean(L, 0);
+				lua_pushfstring(L, "OpenShim PE validation failed: %s", validationError.c_str());
+				return 2;
+			}
+
+			const std::wstring hashPrefix(payload.expectedHash.begin(), payload.expectedHash.begin() + 12);
+			payload.staged = moduleDirectory /
+				(L"openshim_suite_" + std::to_wstring(index + 1) + L".pending." + hashPrefix);
+		}
+
+		const std::filesystem::path helperPath = moduleDirectory / L"bzfile_replace_helper.exe";
+		const std::filesystem::path logPath = GetLogsDirectoryPath() / L"openshim_update.log";
+		const std::filesystem::path statusPath = gameRoot / L"openshim_update.status";
+		std::error_code error;
+		if (!std::filesystem::exists(helperPath, error))
+		{
+			lua_pushboolean(L, 0);
+			lua_pushstring(L, "bzfile_replace_helper.exe is missing beside bzfile.dll");
+			return 2;
+		}
+
+		for (size_t index = 0; index < payloads.size(); ++index)
+		{
+			error.clear();
+			std::filesystem::copy_file(
+				payloads[index].source,
+				payloads[index].staged,
+				std::filesystem::copy_options::overwrite_existing,
+				error);
+			if (error)
+			{
+				for (size_t cleanupIndex = 0; cleanupIndex <= index; ++cleanupIndex)
+				{
+					std::error_code cleanupError;
+					std::filesystem::remove(payloads[cleanupIndex].staged, cleanupError);
+				}
+				lua_pushboolean(L, 0);
+				lua_pushfstring(L, "could not stage OpenShim suite payload %d: %s",
+					static_cast<int>(index + 1), error.message().c_str());
+				return 2;
+			}
+		}
+
+		std::vector<std::wstring> arguments = {
+			L"--suite",
+			std::to_wstring(GetCurrentProcessId()),
+			logPath.wstring(),
+			statusPath.wstring()
+		};
+		for (const auto& payload : payloads)
+		{
+			arguments.push_back(payload.staged.wstring());
+			arguments.push_back(payload.destination.wstring());
+			arguments.emplace_back(payload.expectedHash.begin(), payload.expectedHash.end());
+			arguments.push_back(payload.backup.wstring());
+		}
+
+		{
+			std::ofstream status(statusPath, std::ios::trunc);
+			if (status.is_open())
+			{
+				status << "state=staged\nexpected_sha256=" << payloads[0].expectedHash
+					<< "\npayload_count=" << payloads.size() << "\n";
+			}
+		}
+
+		std::string launchError;
+		if (!LaunchHiddenProcess(helperPath.wstring(), arguments, launchError))
+		{
+			for (const auto& payload : payloads)
+			{
+				std::filesystem::remove(payload.staged, error);
+			}
+			lua_pushboolean(L, 0);
+			lua_pushfstring(L, "could not launch OpenShim suite update helper: %s", launchError.c_str());
 			return 2;
 		}
 
@@ -1120,6 +1307,7 @@ extern "C" int __declspec(dllexport) luaopen_bzfile(lua_State* L)
 		{ "GetFileHash", &File::GetFileHash },
 		{ "GetFileVersion", &File::GetFileVersion },
 		{ "StageOpenShimUpdate", &File::StageOpenShimUpdate },
+		{ "StageOpenShimSuiteUpdate", &File::StageOpenShimSuiteUpdate },
 		{ "Delete", &File::Delete },
 		{ "ListDirectory", &File::ListDirectory },
 		{ "SetAllowWinmmOverwrite", &File::SetAllowWinmmOverwrite },
