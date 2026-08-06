@@ -282,8 +282,15 @@ namespace
 			return false;
 		}
 
+		// Bounded, not INFINITE. This helper holds the named update mutex for its
+		// whole lifetime, so a wait that never returns -- a recycled PID now
+		// belonging to a long-lived process, say -- would leave the mutex held
+		// forever and make every future update exit early as "already_staged",
+		// silently never installing anything again.
+		constexpr DWORD kMaxWaitMilliseconds = 10 * 60 * 1000;
+
 		AppendLogLine(logPath, L"Waiting for process " + std::to_wstring(processId) + L" to exit.");
-		DWORD waitResult = WaitForSingleObject(process, INFINITE);
+		DWORD waitResult = WaitForSingleObject(process, kMaxWaitMilliseconds);
 		CloseHandle(process);
 
 		if (waitResult == WAIT_OBJECT_0)
@@ -291,6 +298,15 @@ namespace
 			AppendLogLine(logPath, L"Observed target process exit.");
 			Sleep(1000); // Give some extra time for handles to release
 			return true;
+		}
+
+		if (waitResult == WAIT_TIMEOUT)
+		{
+			AppendLogLine(
+				logPath,
+				L"Timed out after 10 minutes waiting for process " + std::to_wstring(processId) +
+					L" to exit; abandoning this update so the next launch can retry.");
+			return false;
 		}
 
 		AppendLogLine(logPath, L"WaitForSingleObject failed: " + FormatWindowsError(GetLastError()));

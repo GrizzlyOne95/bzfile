@@ -46,9 +46,53 @@ namespace File
 			return absolute.lexically_normal();
 		}
 
+		// The sandbox root must not be derived from the process working
+		// directory. current_path() is process-global mutable state: the engine,
+		// a common file dialog opened without OFN_NOCHANGEDIR, or any loaded DLL
+		// can move it, and every allowed-path decision would move with it. Pin
+		// the root once to the directory holding the game executable -- the same
+		// directory winmm.dll is loaded from -- and fall back to the working
+		// directory only if that cannot be resolved.
+		std::filesystem::path ResolveGameRootPathOnce()
+		{
+			std::wstring executablePath(MAX_PATH, L'\0');
+			for (;;)
+			{
+				const DWORD length = GetModuleFileNameW(
+					nullptr,
+					executablePath.data(),
+					static_cast<DWORD>(executablePath.size()));
+				if (length == 0)
+				{
+					break;
+				}
+
+				if (length < executablePath.size())
+				{
+					executablePath.resize(length);
+					std::filesystem::path parent =
+						std::filesystem::path(executablePath).parent_path();
+					if (!parent.empty())
+					{
+						return NormalizePath(parent);
+					}
+					break;
+				}
+
+				if (executablePath.size() > 32768)
+				{
+					break;
+				}
+				executablePath.resize(executablePath.size() * 2);
+			}
+
+			return NormalizePath(std::filesystem::current_path());
+		}
+
 		std::filesystem::path GetWorkingDirectoryPath()
 		{
-			return NormalizePath(std::filesystem::current_path());
+			static const std::filesystem::path root = ResolveGameRootPathOnce();
+			return root;
 		}
 
 		std::filesystem::path GetLogsDirectoryPath()
@@ -89,7 +133,7 @@ namespace File
 			return {};
 		}
 
-		std::filesystem::path GetWorkshopDirectoryPath()
+		std::filesystem::path ResolveWorkshopDirectoryPathOnce()
 		{
 			std::filesystem::path bzrRoot = GetWorkingDirectoryPath();
 			std::filesystem::path steamapps = FindSteamAppsDirectory(bzrRoot);
@@ -98,6 +142,14 @@ namespace File
 				steamapps = bzrRoot.parent_path().parent_path();
 			}
 			return NormalizePath(steamapps / "workshop" / "content" / "301650");
+		}
+
+		std::filesystem::path GetWorkshopDirectoryPath()
+		{
+			// Cached for the same reason as the game root, and because resolving
+			// it walks the directory tree looking for "steamapps" on every call.
+			static const std::filesystem::path workshop = ResolveWorkshopDirectoryPathOnce();
+			return workshop;
 		}
 
 		bool IsPathInsideRoot(const std::filesystem::path& candidate, const std::filesystem::path& root)
@@ -128,24 +180,85 @@ namespace File
 			return true;
 		}
 
-		std::filesystem::path CheckPathAllowed(lua_State* L, const std::filesystem::path& requestedPath)
+		// True when the candidate IS a sandbox root, or contains one. Such a path
+		// is technically "inside" the allowed area (a root is inside itself), but
+		// a recursive delete aimed at it would take the entire game installation
+		// with it, so it is never a valid target for a mutating operation.
+		bool IsSandboxRootOrAncestor(const std::filesystem::path& candidate)
 		{
-			auto normalizedPath = NormalizePath(requestedPath);
-			auto workingRoot = GetWorkingDirectoryPath();
-			auto workshopRoot = GetWorkshopDirectoryPath();
+			const std::filesystem::path roots[] = {
+				GetWorkingDirectoryPath(),
+				GetWorkshopDirectoryPath()
+			};
+
+			for (const auto& root : roots)
+			{
+				if (root.empty())
+				{
+					continue;
+				}
+
+				// IsPathInsideRoot(root, candidate) asks whether the root lies
+				// beneath the candidate, i.e. whether the candidate is an
+				// ancestor of (or equal to) that root.
+				if (IsPathInsideRoot(root, candidate))
+				{
+					return true;
+				}
+			}
+
+			return false;
+		}
+
+		// Non-throwing replacement for the old CheckPathAllowed, which called
+		// luaL_error directly. The game's Lua core is built as C, so LUAI_THROW
+		// is longjmp (luaconf.h): raising from here unwound past live
+		// std::filesystem::path and std::string locals without running their
+		// destructors -- a leak on every rejection, and formally undefined
+		// behaviour. Rejections are now ordinary Lua returns instead.
+		bool TryResolveAllowedPath(
+			const char* requestedPath,
+			std::filesystem::path& outResolved,
+			std::string& outError)
+		{
+			outResolved.clear();
+			outError.clear();
+
+			if (requestedPath == nullptr)
+			{
+				outError = "bzfile Error: path argument was nil";
+				return false;
+			}
+
+			auto normalizedPath = NormalizePath(std::filesystem::path(requestedPath));
+			const auto workingRoot = GetWorkingDirectoryPath();
+			const auto workshopRoot = GetWorkshopDirectoryPath();
 
 			if (IsPathInsideRoot(normalizedPath, workingRoot)
 				|| (!workshopRoot.empty() && IsPathInsideRoot(normalizedPath, workshopRoot)))
 			{
-				return normalizedPath;
+				outResolved = std::move(normalizedPath);
+				return true;
 			}
 
-			luaL_error(
-				L,
-				"bzfile Error: refusing to access path outside allowed roots. Path: \"%s\"",
-				normalizedPath.string().c_str());
+			outError = "bzfile Error: refusing to access path outside allowed roots. Path: \""
+				+ normalizedPath.string() + "\"";
+			return false;
+		}
 
-			return {};
+		// Rejection results. Neither raises, so no destructor is skipped.
+		int PushPathRejectionNil(lua_State* L, const std::string& error)
+		{
+			lua_pushnil(L);
+			lua_pushstring(L, error.c_str());
+			return 2;
+		}
+
+		int PushPathRejectionFalse(lua_State* L, const std::string& error)
+		{
+			lua_pushboolean(L, 0);
+			lua_pushstring(L, error.c_str());
+			return 2;
 		}
 
 		std::wstring QuoteCommandLineArgument(const std::wstring& value)
@@ -303,9 +416,21 @@ namespace File
 
 	static int Open(lua_State* L)
 	{
-		std::filesystem::path filePath = CheckPathAllowed(L, luaL_checkstring(L, 1));
-		std::string modeStr = luaL_optstring(L, 2, "r");
-		std::string options = luaL_optstring(L, 3, "app");
+		// Every Lua argument is read before any destructible object exists, so a
+		// luaL_check*/luaL_opt* type error cannot unwind past a live destructor.
+		const char* requestedPath = luaL_checkstring(L, 1);
+		const char* requestedMode = luaL_optstring(L, 2, "r");
+		const char* requestedOptions = luaL_optstring(L, 3, "app");
+
+		std::filesystem::path filePath;
+		std::string pathError;
+		if (!TryResolveAllowedPath(requestedPath, filePath, pathError))
+		{
+			return PushPathRejectionNil(L, pathError);
+		}
+
+		std::string modeStr = requestedMode;
+		std::string options = requestedOptions;
 
 		std::ios_base::openmode openMode{};
 		bool isWrite = false;
@@ -324,11 +449,15 @@ namespace File
 			openMode |= std::ios::binary;
 		}
 
+		// These report through the same nil+message channel the "could not open
+		// file" path below already uses, rather than raising: a raise here would
+		// longjmp past filePath/modeStr/options.
 		if (isWrite)
 		{
 			if (IsWriteProtected(filePath))
 			{
-				return luaL_error(L, "bzfile Error: file is write-protected: \"%s\"", filePath.string().c_str());
+				return PushPathRejectionNil(
+					L, "bzfile Error: file is write-protected: \"" + filePath.string() + "\"");
 			}
 
 			if (options == "app")
@@ -341,12 +470,14 @@ namespace File
 			}
 			else
 			{
-				return luaL_error(L, "bzfile Error: invalid open option \"%s\"", options.c_str());
+				return PushPathRejectionNil(
+					L, "bzfile Error: invalid open option \"" + options + "\"");
 			}
 		}
 		else if (openMode == 0)
 		{
-			return luaL_error(L, "bzfile Error: invalid open mode \"%s\"", modeStr.c_str());
+			return PushPathRejectionNil(
+				L, "bzfile Error: invalid open mode \"" + modeStr + "\"");
 		}
 
 		void* buffer = lua_newuserdata(L, sizeof(std::fstream));
@@ -529,19 +660,38 @@ namespace File
 
 	static int MakeDirectory(lua_State* L)
 	{
-		std::filesystem::path directory = CheckPathAllowed(L, luaL_checkstring(L, 1));
+		const char* requestedPath = luaL_checkstring(L, 1);
+
+		std::filesystem::path directory;
+		std::string pathError;
+		if (!TryResolveAllowedPath(requestedPath, directory, pathError))
+		{
+			return PushPathRejectionFalse(L, pathError);
+		}
+
 		std::error_code error;
 		std::filesystem::create_directories(directory, error);
 		if (error)
 		{
-			return luaL_error(L, "bzfile Error: MakeDirectory failed: %s", error.message().c_str());
+			return PushPathRejectionFalse(
+				L, "bzfile Error: MakeDirectory failed: " + error.message());
 		}
-		return 0;
+
+		lua_pushboolean(L, 1);
+		return 1;
 	}
 
 	static int Exists(lua_State* L)
 	{
-		std::filesystem::path filePath = CheckPathAllowed(L, luaL_checkstring(L, 1));
+		const char* requestedPath = luaL_checkstring(L, 1);
+
+		std::filesystem::path filePath;
+		std::string pathError;
+		if (!TryResolveAllowedPath(requestedPath, filePath, pathError))
+		{
+			return PushPathRejectionFalse(L, pathError);
+		}
+
 		std::error_code error;
 		bool exists = std::filesystem::exists(filePath, error);
 
@@ -551,8 +701,20 @@ namespace File
 
 	static int CopyFile(lua_State* L)
 	{
-		std::filesystem::path sourcePath = CheckPathAllowed(L, luaL_checkstring(L, 1));
-		std::filesystem::path destinationPath = CheckPathAllowed(L, luaL_checkstring(L, 2));
+		// Both strings are fetched up front: the old code called
+		// luaL_checkstring(L, 2) while sourcePath was already constructed, so an
+		// argument-type error there leaked it.
+		const char* requestedSource = luaL_checkstring(L, 1);
+		const char* requestedDestination = luaL_checkstring(L, 2);
+
+		std::filesystem::path sourcePath;
+		std::filesystem::path destinationPath;
+		std::string pathError;
+		if (!TryResolveAllowedPath(requestedSource, sourcePath, pathError)
+			|| !TryResolveAllowedPath(requestedDestination, destinationPath, pathError))
+		{
+			return PushPathRejectionFalse(L, pathError);
+		}
 
 		if (IsWriteProtected(destinationPath))
 		{
@@ -602,8 +764,17 @@ namespace File
 
 	static int ReplaceFileOnExit(lua_State* L)
 	{
-		std::filesystem::path sourcePath = CheckPathAllowed(L, luaL_checkstring(L, 1));
-		std::filesystem::path destinationPath = CheckPathAllowed(L, luaL_checkstring(L, 2));
+		const char* requestedSource = luaL_checkstring(L, 1);
+		const char* requestedDestination = luaL_checkstring(L, 2);
+
+		std::filesystem::path sourcePath;
+		std::filesystem::path destinationPath;
+		std::string pathError;
+		if (!TryResolveAllowedPath(requestedSource, sourcePath, pathError)
+			|| !TryResolveAllowedPath(requestedDestination, destinationPath, pathError))
+		{
+			return PushPathRejectionFalse(L, pathError);
+		}
 
 		if (IsWriteProtected(destinationPath))
 		{
@@ -830,13 +1001,19 @@ namespace File
 
 	static int GetFileHash(lua_State* L)
 	{
-		std::filesystem::path filePath = CheckPathAllowed(L, luaL_checkstring(L, 1));
+		const char* requestedPath = luaL_checkstring(L, 1);
 		const char* algorithm = luaL_optstring(L, 2, "sha256");
 
 		if (_stricmp(algorithm, "sha256") != 0)
 		{
-			luaL_error(L, "bzfile Error: unsupported hash algorithm \"%s\"", algorithm);
-			return 0;
+			return luaL_error(L, "bzfile Error: unsupported hash algorithm \"%s\"", algorithm);
+		}
+
+		std::filesystem::path filePath;
+		std::string pathError;
+		if (!TryResolveAllowedPath(requestedPath, filePath, pathError))
+		{
+			return PushPathRejectionNil(L, pathError);
 		}
 
 		std::string hashValue;
@@ -854,7 +1031,15 @@ namespace File
 
 	static int GetFileVersion(lua_State* L)
 	{
-		const std::filesystem::path filePath = CheckPathAllowed(L, luaL_checkstring(L, 1));
+		const char* requestedPath = luaL_checkstring(L, 1);
+
+		std::filesystem::path filePath;
+		std::string pathError;
+		if (!TryResolveAllowedPath(requestedPath, filePath, pathError))
+		{
+			return PushPathRejectionNil(L, pathError);
+		}
+
 		DWORD ignored = 0;
 		const DWORD versionInfoSize = GetFileVersionInfoSizeW(filePath.c_str(), &ignored);
 		if (versionInfoSize == 0)
@@ -896,8 +1081,17 @@ namespace File
 
 	static int StageOpenShimUpdate(lua_State* L)
 	{
-		const std::filesystem::path sourcePath = CheckPathAllowed(L, luaL_checkstring(L, 1));
-		std::string expectedHash = luaL_checkstring(L, 2);
+		const char* requestedSource = luaL_checkstring(L, 1);
+		const char* requestedHash = luaL_checkstring(L, 2);
+
+		std::filesystem::path sourcePath;
+		std::string pathError;
+		if (!TryResolveAllowedPath(requestedSource, sourcePath, pathError))
+		{
+			return PushPathRejectionFalse(L, pathError);
+		}
+
+		std::string expectedHash = requestedHash;
 		for (char& hashCharacter : expectedHash)
 		{
 			hashCharacter = static_cast<char>(std::tolower(static_cast<unsigned char>(hashCharacter)));
@@ -1036,27 +1230,52 @@ namespace File
 			return 2;
 		}
 
+		// Resolve all three staged paths before building the payload vector. The
+		// old initializer-list form called CheckPathAllowed mid-construction, so
+		// a rejection on the second or third path longjmp'd out with the earlier
+		// payload entries already built and never destroyed.
+		const char* requestedStaged[3] = {
+			luaL_checkstring(L, 1),
+			luaL_checkstring(L, 3),
+			luaL_checkstring(L, 5)
+		};
+		const char* requestedHashes[3] = {
+			luaL_checkstring(L, 2),
+			luaL_checkstring(L, 4),
+			luaL_checkstring(L, 6)
+		};
+
+		std::filesystem::path stagedPaths[3];
+		std::string pathError;
+		for (int stagedIndex = 0; stagedIndex < 3; ++stagedIndex)
+		{
+			if (!TryResolveAllowedPath(requestedStaged[stagedIndex], stagedPaths[stagedIndex], pathError))
+			{
+				return PushPathRejectionFalse(L, pathError);
+			}
+		}
+
 		const std::filesystem::path gameRoot = GetWorkingDirectoryPath();
 		std::vector<Payload> payloads = {
 			{
-				CheckPathAllowed(L, luaL_checkstring(L, 1)),
-				luaL_checkstring(L, 2),
+				stagedPaths[0],
+				requestedHashes[0],
 				L"winmm.dll",
 				gameRoot / L"winmm.dll",
 				{},
 				gameRoot / L"winmm.dll.previous"
 			},
 			{
-				CheckPathAllowed(L, luaL_checkstring(L, 3)),
-				luaL_checkstring(L, 4),
+				stagedPaths[1],
+				requestedHashes[1],
 				L"openshim_net.ini.payload",
 				gameRoot / L"net.ini",
 				{},
 				gameRoot / L"net.ini.previous"
 			},
 			{
-				CheckPathAllowed(L, luaL_checkstring(L, 5)),
-				luaL_checkstring(L, 6),
+				stagedPaths[2],
+				requestedHashes[2],
 				L"openshim_patches.json.payload",
 				gameRoot / L"scripts" / L"patches.json",
 				{},
@@ -1188,16 +1407,56 @@ namespace File
 
 	static int Delete(lua_State* L)
 	{
-		std::filesystem::path path = CheckPathAllowed(L, luaL_checkstring(L, 1));
+		const char* requestedPath = luaL_checkstring(L, 1);
+
+		std::filesystem::path path;
+		std::string pathError;
+		if (!TryResolveAllowedPath(requestedPath, path, pathError))
+		{
+			return PushPathRejectionFalse(L, pathError);
+		}
+
+		// This is remove_all -- a recursive delete. The allowed-root test permits
+		// a sandbox root itself (a root is inside itself), and IsWriteProtected
+		// only matches leaf file names, so before these two guards existed
+		// Delete(GetWorkingDirectory()) would recursively erase the entire game
+		// installation. Refuse roots and their ancestors outright, then refuse
+		// any directory that still has a protected file somewhere beneath it.
+		if (IsSandboxRootOrAncestor(path))
+		{
+			return PushPathRejectionFalse(
+				L,
+				"bzfile Error: refusing to delete a game/workshop root or a directory containing one: \""
+					+ path.string() + "\"");
+		}
 
 		if (IsWriteProtected(path))
 		{
-			lua_pushboolean(L, 0);
-			lua_pushfstring(L, "bzfile Error: path is write-protected: \"%s\"", path.string().c_str());
-			return 2;
+			return PushPathRejectionFalse(
+				L, "bzfile Error: path is write-protected: \"" + path.string() + "\"");
 		}
 
 		std::error_code error;
+		if (std::filesystem::is_directory(path, error) && !error)
+		{
+			std::error_code scanError;
+			std::filesystem::recursive_directory_iterator scan(
+				path, std::filesystem::directory_options::skip_permission_denied, scanError);
+			const std::filesystem::recursive_directory_iterator scanEnd;
+			for (; !scanError && scan != scanEnd; scan.increment(scanError))
+			{
+				if (IsWriteProtected(scan->path()))
+				{
+					return PushPathRejectionFalse(
+						L,
+						"bzfile Error: refusing to recursively delete \"" + path.string()
+							+ "\" because it contains the write-protected file \""
+							+ scan->path().filename().string() + "\"");
+				}
+			}
+		}
+		error.clear();
+
 		bool deleted = std::filesystem::remove_all(path, error) > 0;
 		lua_pushboolean(L, !error && deleted);
 		if (error)
@@ -1210,7 +1469,15 @@ namespace File
 
 	static int ListDirectory(lua_State* L)
 	{
-		std::filesystem::path path = CheckPathAllowed(L, luaL_checkstring(L, 1));
+		const char* requestedPath = luaL_checkstring(L, 1);
+
+		std::filesystem::path path;
+		std::string pathError;
+		if (!TryResolveAllowedPath(requestedPath, path, pathError))
+		{
+			return PushPathRejectionNil(L, pathError);
+		}
+
 		std::error_code error;
 		if (!std::filesystem::is_directory(path, error))
 		{
