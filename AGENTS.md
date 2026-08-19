@@ -2,8 +2,7 @@
 
 Lua-accessible file I/O library for Battlezone 98 Redux, including constrained update/deployment helpers.
 
-## Workspace
-- Primary workspace: `%USERPROFILE%\Documents\GIT\BZR-Workspace\Battlezone98.code-workspace`.
+## Local Environment
 - Sibling Battlezone repos normally live under `%USERPROFILE%\Documents\GIT`. Prefer local sibling source for reference when present; verify its `origin` before editing because historical folder names may differ.
 
 ## BZR Bundle
