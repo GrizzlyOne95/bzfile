@@ -1,44 +1,32 @@
 # bzfile
 
-This repo is part of the local Battlezone workspace opened via
-`%USERPROFILE%\Documents\Battlezone98Redux_Shim.code-workspace`.
+Lua-accessible file I/O library for Battlezone 98 Redux, including constrained update/deployment helpers.
 
-## Workspace Layout
-- Sibling repos normally live under `%USERPROFILE%\Documents\GIT\...`.
-- The primary local game install is typically `%USERPROFILE%\Documents\Battlezone 98 Redux`.
-- Prefer the workspace file and these conventions over hardcoded profile-specific paths.
+## Workspace
+- Primary workspace: `%USERPROFILE%\Documents\GIT\BZR-Workspace\Battlezone98.code-workspace`.
+- Sibling Battlezone repos normally live under `%USERPROFILE%\Documents\GIT`. Prefer local sibling source for reference when present; verify its `origin` before editing because historical folder names may differ.
 
-## Local Role
-- Lua-accessible file I/O library for Battlezone 98 Redux.
+## BZR Bundle
+- **bzfile** — `GrizzlyOne95/bzfile` (this repo): Lua file I/O and constrained update/deployment support.
+- **OpenShim** — `GrizzlyOne95/Battlezone98Redux_Shim`: low-level hooks, patches, RE, SDK/native engine integration.
+- **EXU / ExtraUtilities** — `GrizzlyOne95/ExtraUtilities`: reusable native/Lua-facing runtime features. **EXU always means this repository.**
+- **Campaign Reimagined / CR** — `GrizzlyOne95/Battlezone98Redux_CampaignReimagined`: addon content, Lua consumers, assets, packaging, and end-user integration/validation; its own `AGENTS.md` defines authoritative source/deploy paths.
 
-## BZR Bundle Repository Map
-- Treat the following four repositories as the core **BZR bundle**. They are separate repositories with separate ownership boundaries, but they are expected to be available together for cross-reference during Battlezone 98 Redux work.
-- On the primary development PC, look for local sibling checkouts under `%USERPROFILE%\Documents\GIT` before searching GitHub. Prefer local source for fast code/reference lookup when the checkout is present and current; fall back to GitHub when a sibling repo is unavailable locally or when remote state must be verified.
-- Do not assume the folder name from memory. Verify the checkout and its remote before editing; some repositories may use historical local directory names.
-- **bzfile** = `GrizzlyOne95/bzfile` (this repo): Lua-accessible file I/O support used by Battlezone scripts and addon-side systems.
-- **OpenShim** = `GrizzlyOne95/Battlezone98Redux_Shim`: native `winmm.dll` shim, engine hooks/patches, reverse engineering, SDK/native integration, and low-level Redux behavior.
-- **EXU / ExtraUtilities** = `GrizzlyOne95/ExtraUtilities`: script extender and native utility library, especially reusable Lua-facing APIs and higher-level runtime features. When a task or document says **EXU**, it means this repository; do not rediscover or invent a separate EXU project.
-- **Campaign Reimagined / CR** = `GrizzlyOne95/Battlezone98Redux_CampaignReimagined`: campaign/addon content, Lua consumers, materials/shaders, packaging, integration examples, and end-user validation. Its local Git checkout may be useful for reference, but its own `AGENTS.md` defines the authoritative source/edit and promotion paths.
-- Cross-repo reading is encouraged when it avoids duplicating an API, misunderstanding ownership, or re-reverse-engineering something already solved elsewhere. Cross-repo editing is not automatic: modify another bundle repo only when the task actually requires a coordinated change and after reading that repo's own `AGENTS.md`.
+Cross-repo reading is encouraged. Do not edit another repo merely because it was consulted; read that repo's `AGENTS.md` before coordinated changes.
 
-### BZR Reference and Tooling Repositories
-These repositories are especially useful for research and implementation reference, but are **not default edit targets** for new OpenShim/EXU/CR features. When working locally, first look for them under `%USERPROFILE%\Documents\GIT\<repository-name>` and verify the checkout/remote before relying on it.
+Reference/tooling repos under `%USERPROFILE%\Documents\GIT` (reference, not default edit targets): `BZ98RBlenderToolKit`, `Battlezone98Redux_DedicatedServer`, `BZ1-GameWatcher`, `BZ1_Source`, `BZ2_Source`, `Battlezone_LobbyMonitor`, `BZNTools`, `Battlezone98Redux_AudioTool`, `Battlezone98Redux_WorldBuilder`, `Battlezone98Redux_ZFSSpecialist`.
 
-- `GrizzlyOne95/BZ98RBlenderToolKit` — Redux asset, mesh/skeleton, animation, and Blender pipeline reference.
-- `GrizzlyOne95/Battlezone98Redux_DedicatedServer` — dedicated-server behavior and multiplayer/server reference.
-- `GrizzlyOne95/BZ1-GameWatcher` — Battlezone 1 game/server watching and related integration reference.
-- `GrizzlyOne95/BZ1_Source` — Battlezone 1 source reference for legacy engine/game behavior.
-- `GrizzlyOne95/BZ2_Source` — Battlezone II source reference for related engine/game concepts.
-- `GrizzlyOne95/Battlezone_LobbyMonitor` — lobby/network monitoring reference.
-- `GrizzlyOne95/BZNTools` — BZN/map tooling and format reference.
-- `GrizzlyOne95/Battlezone98Redux_AudioTool` — Redux audio tooling/format reference.
-- `GrizzlyOne95/Battlezone98Redux_WorldBuilder` — world/map-building tooling reference.
-- `GrizzlyOne95/Battlezone98Redux_ZFSSpecialist` — ZFS/archive/content-format reference.
-- Use these repos to answer questions, compare implementations, recover formats/behavior, and avoid duplicated investigation. Do not include them in a feature's change set merely because they were consulted.
+## Git Workflow
+- Before editing, inspect `git status -sb` and the relevant diff; preserve pre-existing user changes.
+- Normal work goes on a task branch, usually `agent/<short-description>`, never directly on the default/protected branch.
+- Agents may commit and push coherent task-owned checkpoints without repeatedly asking. Prefer validated milestones; a clearly labeled `WIP:` checkpoint is acceptable when preserving valuable intermediate work.
+- Stage only task-owned files. Never blanket-stage, clean, restore, or otherwise absorb/destroy unrelated changes in a mixed worktree.
+- Do not rewrite shared history or force-push unless explicitly requested.
+- PR merges, releases/tags, Workshop publication, and other external release/deployment actions require explicit user instruction.
+- Do not commit secrets, machine credentials, transient build/runtime output, crash dumps, or scratch artifacts the repo does not intentionally track.
 
-## Cross-Repo Pointers
-- Primary addon-side usage lives in Campaign Reimagined. Consult `GrizzlyOne95/Battlezone98Redux_CampaignReimagined` or its local checkout under `%USERPROFILE%\Documents\GIT` for usage examples, while following that repo's own canonical-source rules before editing it.
-- Native engine and shim integration lives in `GrizzlyOne95/Battlezone98Redux_Shim`.
-- Higher-level Lua/native utility integration lives in `GrizzlyOne95/ExtraUtilities` (EXU).
-
-Open `%USERPROFILE%\Documents\Battlezone98Redux_Shim.code-workspace` when a task may span repos.
+## Safety / Task Routing
+- `README.md` is the API/behavior reference; read the relevant section when changing exposed Lua APIs or update helpers rather than loading it for unrelated tasks.
+- When changing write, copy, delete, replacement, or update behavior, read `.jules/sentinel.md` first. Critical DLL write protection must remain centralized and consistently applied across every mutating filesystem path.
+- Preserve the constrained nature of OpenShim update helpers: scripts must not gain arbitrary destinations merely for convenience.
+- Campaign-side consumers and deployment behavior belong in CR; low-level native engine behavior belongs in OpenShim; reusable runtime feature logic belongs in EXU.
