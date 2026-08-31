@@ -37,14 +37,15 @@ file:Close()
 local readFile = bzfile.Open(filePath, "r")
 
 -- Read line by line
-local contents = file:Readln()
+local contents = readFile:Readln()
 while contents ~= nil do
     print(contents)
-    contents = file:Readln()
+    contents = readFile:Readln()
 end
 
--- Or dump the whole contents of the file into a lua stirng:
-local bigString = file:Dump()
+-- Or dump the whole contents of the file into a Lua string:
+local bigString = readFile:Dump()
+readFile:Close()
 ```
 
 Specification:
@@ -89,7 +90,7 @@ Reads a line.
 ```lua
 file:Dump() -> content: string
 ```
-Dumps the entire contents of the file into one string
+Dumps the entire contents of the file into one string.
 
 ```lua
 file:Flush() -> self
@@ -178,3 +179,14 @@ before game exit, backs up all existing destinations, promotes and verifies all
 three payloads, and rolls the suite back if any promotion or verification
 fails. Progress is written to `openshim_update.status` and details to
 `openshim_update.log`.
+
+## Builds and releases
+
+Every pull request and push to `main` builds the x86 DLL and replacement helper,
+then exercises the helper's verified single-file and three-file transaction
+paths against isolated temporary files. Successful CI runs publish short-lived
+GitHub Actions artifacts for testing.
+
+Permanent GitHub Releases are created only from version tags matching `v*`.
+A tagged release contains both binaries plus SHA-256 checksums. The repository
+no longer treats a mutable `latest` tag/release as a versioned distribution.
