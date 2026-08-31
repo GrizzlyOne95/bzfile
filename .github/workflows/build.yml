@@ -19,18 +19,48 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      - name: Resolve and validate source version
+        id: version
+        shell: pwsh
+        run: |
+          $header = Get-Content -LiteralPath "include\bzfile_version.h" -Raw
+          if ($header -notmatch '#define\s+BZFILE_VERSION_STRING\s+"([0-9]+\.[0-9]+\.[0-9]+)"') {
+            throw "Could not resolve BZFILE_VERSION_STRING from include/bzfile_version.h."
+          }
+          $version = $matches[1]
+          "version=$version" | Out-File -FilePath $env:GITHUB_OUTPUT -Append -Encoding utf8
+          $version | Set-Content -LiteralPath VERSION.txt -Encoding ascii
+
+          # A permanent GitHub release must be impossible to create under a tag
+          # that disagrees with the version embedded in both shipped binaries.
+          if ("${{ github.ref_type }}" -eq "tag") {
+            $expectedTag = "v$version"
+            if ("${{ github.ref_name }}" -ne $expectedTag) {
+              throw "Tag/source version mismatch: tag '${{ github.ref_name }}' must be '$expectedTag'."
+            }
+          }
+
       - name: Add MSBuild to PATH
         uses: microsoft/setup-msbuild@v2
 
       - name: Build Release x86
         run: msbuild bzfile.sln /p:Configuration=Release /p:Platform=x86
 
-      - name: Verify build outputs
+      - name: Verify build outputs and PE versions
         shell: pwsh
         run: |
+          $sourceVersion = "${{ steps.version.outputs.version }}"
+          $expectedFileVersion = "$sourceVersion.0"
           foreach ($path in @("Release\bzfile.dll", "Release\bzfile_replace_helper.exe")) {
             if (-not (Test-Path -LiteralPath $path)) {
               throw "Expected build output is missing: $path"
+            }
+            $versionInfo = (Get-Item -LiteralPath $path).VersionInfo
+            if ($versionInfo.FileVersion -ne $expectedFileVersion) {
+              throw "PE FileVersion mismatch for '$path': expected '$expectedFileVersion', got '$($versionInfo.FileVersion)'."
+            }
+            if ($versionInfo.ProductVersion -ne $expectedFileVersion) {
+              throw "PE ProductVersion mismatch for '$path': expected '$expectedFileVersion', got '$($versionInfo.ProductVersion)'."
             }
           }
 
@@ -45,6 +75,7 @@ jobs:
           path: |
             Release/bzfile.dll
             Release/bzfile_replace_helper.exe
+            VERSION.txt
           if-no-files-found: error
           retention-days: 14
 
@@ -70,10 +101,13 @@ jobs:
           mkdir release
           find artifacts -name 'bzfile.dll' -exec cp '{}' release/ \;
           find artifacts -name 'bzfile_replace_helper.exe' -exec cp '{}' release/ \;
+          find artifacts -name 'VERSION.txt' -exec cp '{}' release/ \;
           test -f release/bzfile.dll
           test -f release/bzfile_replace_helper.exe
-          (cd release && sha256sum bzfile.dll bzfile_replace_helper.exe > SHA256SUMS.txt)
-          (cd release && zip -r ../bzfile-${GITHUB_REF_NAME}.zip bzfile.dll bzfile_replace_helper.exe SHA256SUMS.txt)
+          test -f release/VERSION.txt
+          test "v$(tr -d '\r\n' < release/VERSION.txt)" = "$GITHUB_REF_NAME"
+          (cd release && sha256sum bzfile.dll bzfile_replace_helper.exe VERSION.txt > SHA256SUMS.txt)
+          (cd release && zip -r ../bzfile-${GITHUB_REF_NAME}.zip bzfile.dll bzfile_replace_helper.exe VERSION.txt SHA256SUMS.txt)
 
       - name: Create GitHub Release
         uses: softprops/action-gh-release@v2

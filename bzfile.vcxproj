@@ -108,6 +108,10 @@
   <ItemGroup>
     <ClCompile Include="src\dllmain.cpp" />
     <ClCompile Include="src\LuaExport.cpp" />
+    <ClCompile Include="src\version.cpp" />
+  </ItemGroup>
+  <ItemGroup>
+    <ResourceCompile Include="src\bzfile_version.rc" />
   </ItemGroup>
   <ItemGroup>
     <ProjectReference Include="bzfile_replace_helper.vcxproj">
