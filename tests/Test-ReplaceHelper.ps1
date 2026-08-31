@@ -19,6 +19,26 @@ function Get-Sha([string]$Path) {
     return (Get-FileHash -LiteralPath $Path -Algorithm SHA256).Hash.ToLowerInvariant()
 }
 
+function Invoke-Helper([string[]]$Arguments) {
+    # The helper is linked as a Windows GUI subsystem executable, so invoking it
+    # directly from PowerShell does not reliably set $LASTEXITCODE or wait for
+    # completion. ProcessStartInfo gives us deterministic waiting and preserves
+    # each argument boundary without manual command-line quoting.
+    $startInfo = [System.Diagnostics.ProcessStartInfo]::new()
+    $startInfo.FileName = $script:helper
+    $startInfo.UseShellExecute = $false
+    foreach ($argument in $Arguments) {
+        $startInfo.ArgumentList.Add([string]$argument)
+    }
+
+    $process = [System.Diagnostics.Process]::Start($startInfo)
+    if ($null -eq $process) {
+        throw "Could not launch replacement helper."
+    }
+    $process.WaitForExit()
+    return $process.ExitCode
+}
+
 $helper = [System.IO.Path]::GetFullPath($HelperPath)
 if (-not (Test-Path -LiteralPath $helper)) {
     throw "Replacement helper was not built: $helper"
@@ -40,8 +60,8 @@ try {
     Write-AsciiFile $destination "old payload"
     $expected = Get-Sha $staged
 
-    & $helper "0" $staged $destination $log $expected $backup $status
-    Assert-True ($LASTEXITCODE -eq 0) "single-file replacement returned exit code $LASTEXITCODE"
+    $exitCode = Invoke-Helper @("0", $staged, $destination, $log, $expected, $backup, $status)
+    Assert-True ($exitCode -eq 0) "single-file replacement returned exit code $exitCode"
     Assert-True ((Get-Sha $destination) -eq $expected) "single-file destination hash is wrong"
     Assert-True ((Get-Content -LiteralPath $backup -Raw) -eq "old payload") "single-file backup was not preserved"
     Assert-True (-not (Test-Path -LiteralPath $staged)) "single-file staged payload still exists after promotion"
@@ -58,8 +78,8 @@ try {
     Write-AsciiFile $badStaged "tampered payload"
     Write-AsciiFile $badDestination "keep me"
 
-    & $helper "0" $badStaged $badDestination $badLog ("0" * 64) $badBackup $badStatus
-    Assert-True ($LASTEXITCODE -eq 1) "hash mismatch did not fail"
+    $exitCode = Invoke-Helper @("0", $badStaged, $badDestination, $badLog, ("0" * 64), $badBackup, $badStatus)
+    Assert-True ($exitCode -eq 1) "hash mismatch did not fail"
     Assert-True ((Get-Content -LiteralPath $badDestination -Raw) -eq "keep me") "hash mismatch modified destination"
     Assert-True ((Get-Content -LiteralPath $badStatus -Raw) -match "state=failed") "hash mismatch status did not report failure"
 
@@ -68,8 +88,8 @@ try {
     New-Item -ItemType Directory -Path $missing -Force | Out-Null
     $missingStatus = Join-Path $missing "status.txt"
     $missingLog = Join-Path $missing "replace.log"
-    & $helper "0" (Join-Path $missing "does-not-exist.bin") (Join-Path $missing "destination.bin") $missingLog ("0" * 64) (Join-Path $missing "backup.bin") $missingStatus
-    Assert-True ($LASTEXITCODE -eq 1) "missing staged file did not fail"
+    $exitCode = Invoke-Helper @("0", (Join-Path $missing "does-not-exist.bin"), (Join-Path $missing "destination.bin"), $missingLog, ("0" * 64), (Join-Path $missing "backup.bin"), $missingStatus)
+    Assert-True ($exitCode -eq 1) "missing staged file did not fail"
     Assert-True ((Get-Content -LiteralPath $missingStatus -Raw) -match "state=failed") "missing staged status did not report failure"
 
     # Three-file suite success: the campaign updater depends on all three files
@@ -91,8 +111,8 @@ try {
         $suiteArgs += @($suiteStaged, $suiteDestination, $suiteHash, $suiteBackup)
     }
 
-    & $helper @suiteArgs
-    Assert-True ($LASTEXITCODE -eq 0) "suite replacement returned exit code $LASTEXITCODE"
+    $exitCode = Invoke-Helper $suiteArgs
+    Assert-True ($exitCode -eq 0) "suite replacement returned exit code $exitCode"
     Assert-True ((Get-Content -LiteralPath $suiteStatus -Raw) -match "state=complete") "suite status did not reach complete"
     for ($i = 1; $i -le 3; $i++) {
         Assert-True ((Get-Sha (Join-Path $suite "destination$i.bin")) -eq $expectedHashes[$i - 1]) "suite destination $i hash is wrong"
