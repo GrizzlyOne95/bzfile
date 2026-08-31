@@ -2,66 +2,84 @@ name: Build and Release
 
 on:
   push:
-    branches: [ main ]
-    tags: [ 'v*' ]
+    branches: [main]
+    tags: ['v*']
   pull_request:
-    branches: [ main ]
+    branches: [main]
   workflow_dispatch:
+
+permissions:
+  contents: read
 
 jobs:
   build:
+    name: Build and test bzfile
     runs-on: windows-latest
 
     steps:
-    - uses: actions/checkout@v4
+      - uses: actions/checkout@v4
 
-    - name: Add MSBuild to PATH
-      uses: microsoft/setup-msbuild@v2
+      - name: Add MSBuild to PATH
+        uses: microsoft/setup-msbuild@v2
 
-    - name: Build
-      run: msbuild bzfile.sln /p:Configuration=Release /p:Platform=x86
+      - name: Build Release x86
+        run: msbuild bzfile.sln /p:Configuration=Release /p:Platform=x86
 
-    - name: List Files
-      run: Get-ChildItem -Recurse
+      - name: Verify build outputs
+        shell: pwsh
+        run: |
+          foreach ($path in @("Release\bzfile.dll", "Release\bzfile_replace_helper.exe")) {
+            if (-not (Test-Path -LiteralPath $path)) {
+              throw "Expected build output is missing: $path"
+            }
+          }
 
-    - name: Upload bzfile.dll
-      uses: actions/upload-artifact@v4
-      with:
-        name: bzfile-dll
-        path: Release/bzfile.dll
+      - name: Test deferred replacement transactions
+        shell: pwsh
+        run: .\tests\Test-ReplaceHelper.ps1 -HelperPath .\Release\bzfile_replace_helper.exe
 
-    - name: Upload bzfile_replace_helper.exe
-      uses: actions/upload-artifact@v4
-      with:
-        name: bzfile-replace-helper
-        path: Release/bzfile_replace_helper.exe
+      - name: Upload verified binaries
+        uses: actions/upload-artifact@v4
+        with:
+          name: bzfile-${{ github.sha }}
+          path: |
+            Release/bzfile.dll
+            Release/bzfile_replace_helper.exe
+          if-no-files-found: error
+          retention-days: 14
 
   release:
+    name: Publish versioned release
     needs: build
-    if: github.event_name == 'workflow_dispatch' || (github.event_name == 'push' && (github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/tags/v')))
+    if: startsWith(github.ref, 'refs/tags/v')
     runs-on: ubuntu-latest
     permissions:
       contents: write
+
     steps:
-    - name: Download artifacts
-      uses: actions/download-artifact@v4
-      with:
-        path: artifacts
+      - name: Download verified binaries
+        uses: actions/download-artifact@v4
+        with:
+          name: bzfile-${{ github.sha }}
+          path: artifacts
 
-    - name: Package Release
-      run: |
-        mkdir release
-        # Use find to be more flexible with artifact structure if it changed in v4
-        find artifacts -name "bzfile.dll" -exec cp {} release/ \;
-        find artifacts -name "bzfile_replace_helper.exe" -exec cp {} release/ \;
-        cd release
-        zip -r ../bzfile-release.zip .
+      - name: Package release and checksums
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir release
+          find artifacts -name 'bzfile.dll' -exec cp '{}' release/ \;
+          find artifacts -name 'bzfile_replace_helper.exe' -exec cp '{}' release/ \;
+          test -f release/bzfile.dll
+          test -f release/bzfile_replace_helper.exe
+          (cd release && sha256sum bzfile.dll bzfile_replace_helper.exe > SHA256SUMS.txt)
+          (cd release && zip -r ../bzfile-${GITHUB_REF_NAME}.zip bzfile.dll bzfile_replace_helper.exe SHA256SUMS.txt)
 
-    - name: Create Release
-      uses: softprops/action-gh-release@v2
-      with:
-        tag_name: ${{ startsWith(github.ref, 'refs/tags/v') && github.ref_name || 'latest' }}
-        name: ${{ startsWith(github.ref, 'refs/tags/v') && github.ref_name || 'Latest Build' }}
-        files: bzfile-release.zip
-        generate_release_notes: true
-        make_latest: ${{ startsWith(github.ref, 'refs/tags/v') }}
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            bzfile-${{ github.ref_name }}.zip
+            release/SHA256SUMS.txt
+          generate_release_notes: true
+          make_latest: true
