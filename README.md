@@ -1,6 +1,32 @@
 # bzfile
 File IO Library for Battlezone 98 Redux
 
+## Installation (Linux / Proton)
+
+The shipped `bzfile.dll` is a **Win32** Lua C module. Linux hosts deploy that same DLL into a Proton game folder; there is no native Linux `.so`.
+
+Native Steam or Flatpak — paste in a terminal:
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/GrizzlyOne95/bzfile/main/scripts/install_linux.sh | bash -s -- --native
+```
+
+Snap Steam — paste in a terminal:
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/GrizzlyOne95/bzfile/main/scripts/install_linux.sh | bash -s -- --snap
+```
+
+No Steam launch options are required. Proton loads `bzfile.dll` as a Windows DLL (this is not an OpenShim `winmm.dll` proxy).
+
+To copy a local Windows build instead of a GitHub release:
+
+```bash
+./scripts/deploy_linux_proton.sh
+```
+
+Windows still builds `bzfile.sln` as **Release | x86**. Host-side Linux checks are `bash tests/linux/run.sh`.
+
 ## High-Level Summary
 
 - Lightweight Lua-facing file I/O for Battlezone 98 Redux mods and addon tools.
@@ -181,6 +207,10 @@ fails. Progress is written to `openshim_update.status` and details to
 `openshim_update.log`.
 
 ## Builds and releases
+
+The game-facing binaries (`bzfile.dll`, `bzfile_replace_helper.exe`) are Win32
+and are built with MSVC. Linux CI runs host-side path/script checks only; it
+does not produce a MinGW DLL.
 
 Every pull request and push to `main` builds the x86 DLL and replacement helper,
 then exercises the helper's verified single-file and three-file transaction
