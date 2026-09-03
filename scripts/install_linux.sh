@@ -79,25 +79,36 @@ latest_asset_url() {
     printf '%s\n' "$json" | tr '"' '\n' | grep -E "^https://github.com/.+/download/.+${needle}$" | head -n1
 }
 
-is_snap_game() {
-    [[ "$1" == "$HOME/snap/steam/"* ]]
-}
-
+# Snap vs native is decided by the Steam root that discovered the install
+# (BZR_GAME_FLAVORS), never by the game pathname: a Snap Steam
+# libraryfolders.vdf can list a library anywhere on disk.
 filter_flavor() {
     local flavor="$1"
     local kept=()
-    local path
-    for path in "${BZR_GAME_PATHS[@]:-}"; do
+    local kept_flavors=()
+    local i path path_flavor
+    for ((i = 0; i < ${#BZR_GAME_PATHS[@]}; i++)); do
+        path="${BZR_GAME_PATHS[$i]}"
+        path_flavor="${BZR_GAME_FLAVORS[$i]:-any}"
         case "$flavor" in
-            all) kept+=("$path") ;;
-            snap) is_snap_game "$path" && kept+=("$path") ;;
-            native) is_snap_game "$path" || kept+=("$path") ;;
+            all)
+                kept+=("$path")
+                kept_flavors+=("$path_flavor")
+                ;;
+            snap|native)
+                if [[ "$path_flavor" == "$flavor" || "$path_flavor" == "any" ]]; then
+                    kept+=("$path")
+                    kept_flavors+=("$path_flavor")
+                fi
+                ;;
         esac
     done
     if [[ ${#kept[@]} -gt 0 ]]; then
         BZR_GAME_PATHS=("${kept[@]}")
+        BZR_GAME_FLAVORS=("${kept_flavors[@]}")
     else
         BZR_GAME_PATHS=()
+        BZR_GAME_FLAVORS=()
     fi
 }
 
@@ -125,7 +136,15 @@ download_matched_release() {
     local dest="$1"
     mkdir -p "$dest"
     local zip_url
-    zip_url="$(latest_asset_url "$REPO_SLUG" '\.zip')"
+    # Release workflow publishes bzfile-<tag>.zip; fall back to any zip asset
+    # only if that naming is absent.
+    zip_url="$(latest_asset_url "$REPO_SLUG" 'bzfile-v[^/]*\.zip')"
+    if [[ -z "$zip_url" ]]; then
+        zip_url="$(latest_asset_url "$REPO_SLUG" 'bzfile-[^/]*\.zip')"
+    fi
+    if [[ -z "$zip_url" ]]; then
+        zip_url="$(latest_asset_url "$REPO_SLUG" '\.zip')"
+    fi
     if [[ -z "$zip_url" ]]; then
         return 1
     fi
