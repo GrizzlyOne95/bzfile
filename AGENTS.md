@@ -27,6 +27,10 @@ Reference/tooling repos under `%USERPROFILE%\Documents\GIT` (reference, not defa
 - PR merges, releases/tags, Workshop publication, and other external release/deployment actions require explicit user instruction.
 - Do not commit secrets, machine credentials, transient build/runtime output, crash dumps, or scratch artifacts the repo does not intentionally track.
 
+## Linux / Proton
+- Game-facing binaries remain Win32 (`bzfile.dll`, `bzfile_replace_helper.exe`) and are built with MSVC. Linux hosts run `tests/linux/run.sh` and may deploy into a Proton game folder with `scripts/install_linux.sh` / `scripts/deploy_linux_proton.sh`.
+- Do not add a MinGW DLL target or claim a native Linux `.so`. Document Proton as a Win32-in-Wine layout, same as OpenShim.
+
 ## Safety / Task Routing
 - `README.md` is the API/behavior reference; read the relevant section when changing exposed Lua APIs or update helpers rather than loading it for unrelated tasks.
 - When changing write, copy, delete, replacement, or update behavior, read `.jules/sentinel.md` first. Critical DLL write protection must remain centralized and consistently applied across every mutating filesystem path.
