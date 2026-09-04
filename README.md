@@ -1,6 +1,10 @@
 # bzfile
 File IO Library for Battlezone 98 Redux
 
+Windows/GOG, Windows/Steam, Linux/Steam via Proton, and Linux/GOG through a
+compatible Wine/Proton prefix are maintained together. See the shared
+[`BZR platform and distribution compatibility policy`](Docs/BZR_PLATFORM_COMPATIBILITY.md).
+
 ## Installation (Linux / Proton)
 
 The shipped `bzfile.dll` is a **Win32** Lua C module. Linux hosts deploy that same DLL into a Proton game folder; there is no native Linux `.so`.
