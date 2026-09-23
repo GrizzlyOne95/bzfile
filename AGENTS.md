@@ -5,7 +5,7 @@ Lua-accessible file I/O for Battlezone 98 Redux, including tightly constrained u
 ## Ownership and local sources
 
 - **bzfile** owns Lua file I/O and constrained update/replacement primitives. Route low-level hooks to **OpenShim**, reusable runtime APIs to **EXU**, and campaign consumers/packaging to **CR**.
-- Sibling repositories normally live under `%USERPROFILE%\Documents\GIT`; verify `origin` and branch before relying on them. CR's only editable source is `%USERPROFILE%\Documents\Google Drive\Ian Files\Battlezone Files\Redux Maps\Open Patch - CampaignReimagined`; never edit or reverse-sync a stale CR copy under `Documents\GIT` or its deployed runtime.
+- Sibling repositories normally live under `%USERPROFILE%\Documents\GIT`; verify `origin` and branch before relying on them. CR's only editable source is `%USERPROFILE%\Documents\GIT\Campaign-Reimagined`; never edit or reverse-sync its retained Google Drive legacy tree or deployed runtime.
 - Read a sibling's `AGENTS.md` before editing it.
 
 ## Load only when relevant
