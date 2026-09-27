@@ -25,7 +25,12 @@ try {
     $script = Join-Path $scratch "bzfile_api_tests.lua"
     Copy-Item -LiteralPath $ScriptPath -Destination $script
 
-    Push-Location $scratch
+    # Run from a different working directory than the game root, as a game
+    # launched through a shortcut or launcher can be: bzfile must resolve
+    # relative paths from the root, not from here.
+    $elsewhere = Join-Path $scratch "elsewhere"
+    New-Item -ItemType Directory -Path $elsewhere | Out-Null
+    Push-Location $elsewhere
     try {
         & (Join-Path $scratch "bzfile_lua_host.exe") $script
         $exitCode = $LASTEXITCODE

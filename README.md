@@ -37,13 +37,14 @@ Windows still builds `bzfile.sln` as **Release | x86**. Host-side Linux checks a
 - Covers the core text-file workflow: open, read, write, flush, close, working
   directory discovery, workshop directory discovery, directory creation, and
   existence checks.
-- Current repo-side improvements focus on safer update and deployment workflows:
-  guarded copy operations, a deferred replace-on-exit path for files that may be
-  locked while the game is running, and stricter resolution of allowed game and
-  workshop write roots.
-- File hashing support is included for patch/update verification, and the
-  bundled Lua library snapshot has been refreshed to stay aligned with the
-  repaired runtime used by the surrounding Battlezone tooling stack.
+- All paths are confined to the game folder and, on Steam, the Workshop
+  content folder. Native code and update files are write-protected (see
+  [Write protection](#write-protection)).
+- File hashing and PE version reading support update verification, and a
+  constrained, hash-verified path stages OpenShim updates that a helper
+  installs once the game exits.
+- bzfile links its own copy of the game's Lua core and refuses to load on a
+  game build it does not match (see `lib/README.md`).
 
 Quick and dirty tutorial:
 
@@ -138,14 +139,18 @@ Flushes the input/output buffer, makes text appear immediately in the file, may 
 ```lua
 file:Close() -> nil
 ```
-Closes the handle to the file, file object becomes nil.
+Closes the handle. The variable still refers to the closed handle; further
+method calls raise "file is not open".
 
 ### Filesystem Functions
 
 ```lua
 bzfile.GetWorkingDirectory() -> path: string
 ```
-Gets the root directory of the game (..\common\Battlezone98Redux\).
+Gets the game folder: the directory holding the game executable (for Steam,
+`...\steamapps\common\Battlezone 98 Redux`). Relative paths passed to any
+bzfile function are resolved from here. Returns `nil, errorMessage` if the
+path cannot be represented in the system code page.
 
 ```lua
 bzfile.GetWorkshopDirectory() -> path: string
@@ -236,7 +241,9 @@ bzfile.StageOpenShimUpdate(sourcePath: string, expectedSha256: string)
 Validates and stages a constrained OpenShim update. Unlike the generic file APIs,
 the script cannot choose the destination: it is always `winmm.dll` in the game
 root. The source must be an x86 DLL named `winmm.dll` beside the loaded
-`bzfile.dll`, and its SHA-256 must match `expectedSha256`. The hidden helper waits
+`bzfile.dll`, and its SHA-256 must match `expectedSha256`. Both staging
+functions work only when `bzfile.dll` is loaded from the Campaign Reimagined
+Workshop item folder (`3686673790`). The hidden helper waits
 for Battlezone to exit, backs up the previous shim, atomically promotes the
 payload, verifies the installed hash, and rolls back on verification failure
 (removing the new file instead when there was no previous shim).
@@ -288,5 +295,7 @@ paths against isolated temporary files. Successful CI runs publish short-lived
 GitHub Actions artifacts for testing.
 
 Permanent GitHub Releases are created only from version tags matching `v*`.
-A tagged release contains both binaries plus SHA-256 checksums. The repository
-no longer treats a mutable `latest` tag/release as a versioned distribution.
+A tagged release contains both binaries plus SHA-256 checksums, and the Linux
+installer only accepts that `bzfile-v*.zip` asset. An older "Latest Build"
+release under a mutable `latest` tag predates the path hardening and is not a
+supported distribution.
