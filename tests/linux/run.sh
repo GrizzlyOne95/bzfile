@@ -78,6 +78,27 @@ test_version_header() {
     pass "version header parses"
 }
 
+# The write-protection rule shared by every mutating bzfile binding is pure
+# C++, so it is tested here even though the DLL itself only builds with MSVC.
+test_write_policy() {
+    local cxx="${CXX:-}" candidate
+    if [[ -z "$cxx" ]]; then
+        for candidate in g++ clang++; do
+            if command -v "$candidate" >/dev/null 2>&1; then
+                cxx="$candidate"
+                break
+            fi
+        done
+    fi
+    [[ -n "$cxx" ]] || fail "no C++ compiler for tests/host/write_policy_tests.cpp"
+
+    "$cxx" -std=c++17 -Wall -Wextra -Werror \
+        -o "$TMP_ROOT/write_policy_tests" "$ROOT/tests/host/write_policy_tests.cpp" \
+        || fail "tests/host/write_policy_tests.cpp did not compile"
+    "$TMP_ROOT/write_policy_tests" || fail "write policy checks failed"
+    pass "write policy"
+}
+
 test_script_syntax() {
     local script
     for script in \
@@ -213,6 +234,7 @@ test_flavour_filter_uses_discovering_root() {
 }
 
 test_version_header
+test_write_policy
 test_script_syntax
 test_steam_path_override
 test_help_exits_clean
