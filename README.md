@@ -238,7 +238,8 @@ the script cannot choose the destination: it is always `winmm.dll` in the game
 root. The source must be an x86 DLL named `winmm.dll` beside the loaded
 `bzfile.dll`, and its SHA-256 must match `expectedSha256`. The hidden helper waits
 for Battlezone to exit, backs up the previous shim, atomically promotes the
-payload, verifies the installed hash, and rolls back on verification failure.
+payload, verifies the installed hash, and rolls back on verification failure
+(removing the new file instead when there was no previous shim).
 Progress is written to `winmm_update.status` and details to
 `winmm_replace.log` in the game root.
 
@@ -258,6 +259,22 @@ before game exit, backs up all existing destinations, promotes and verifies all
 three payloads, and rolls the suite back if any promotion or verification
 fails. Progress is written to `openshim_update.status` and details to
 `openshim_update.log`.
+
+Both staging functions refuse while an update helper is already running (see
+`IsOpenShimUpdateActive`), and write `state=failed` if the helper cannot be
+launched. The helper waits for the game to exit however long that takes,
+re-checks every staged hash before promoting, installs each file by copying it
+beside the destination and renaming it into place, and on failure rolls back
+only the files it actually replaced. Status states are `staged`,
+`waiting_for_exit`, `promoting`, `complete` and `failed`.
+
+```lua
+bzfile.IsOpenShimUpdateActive() -> active: boolean
+```
+True while an update helper owns a staged OpenShim update. A status file that
+still reads `staged` or `waiting_for_exit` while this is false was left behind
+by a helper that never finished (crash, kill, power loss); the update can be
+staged again.
 
 ## Builds and releases
 
