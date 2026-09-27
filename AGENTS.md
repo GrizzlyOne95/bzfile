@@ -14,7 +14,7 @@ Lua-accessible file I/O for Battlezone 98 Redux, including tightly constrained u
 - Native loading, paths, filesystem/process behavior, discovery, installers, deployment, packaging, or updates: read `Docs/BZR_PLATFORM_COMPATIBILITY.md` and account for Windows/GOG, Windows/Steam, Proton, and Wine.
 - Exposed APIs or update helpers: read the relevant `README.md` section.
 - Any write, copy, delete, replacement, or update behavior: read `.jules/sentinel.md` first. Keep critical-DLL protection centralized and applied to every mutating path.
-- The shared Lua and platform documents must remain byte-identical across bzfile, OpenShim, EXU, and CR; update all four in one workstream if either changes.
+- The shared Lua and platform documents must remain byte-identical across bzfile, OpenShim, EXU, and CR; update all four in one workstream if either changes. `tests/linux/run.sh` pins their SHA-256 hashes; update the pinned hashes in all four repositories' checks too.
 
 ## Safety and platform boundaries
 
