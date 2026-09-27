@@ -117,6 +117,8 @@ do
     handle:Close()
 end
 
+check(bzfile.IsOpenShimUpdateActive() == false, "no update helper is active")
+
 -- Roots -------------------------------------------------------------------
 
 check(bzfile.GetWorkshopDirectory() == "", "no Workshop root outside a Steam library")
