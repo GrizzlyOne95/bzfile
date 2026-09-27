@@ -126,7 +126,16 @@ detect_bzr_game_paths() {
     fi
 
     if [[ -n "${BZR_GAME_PATH:-}" ]]; then
-        BZR_GAME_PATHS=("$BZR_GAME_PATH")
-        BZR_GAME_FLAVORS=("any")
+        # An explicit path gets the same check auto-detection applies: it
+        # must be a game folder. Otherwise a typo deploys into, and leaves
+        # backups in, whatever directory was named.
+        BZR_GAME_PATHS=()
+        BZR_GAME_FLAVORS=()
+        if [[ -d "$BZR_GAME_PATH" ]] && _bzr_game_exe_present "$BZR_GAME_PATH"; then
+            BZR_GAME_PATHS=("$(_bzr_canonical_path "$BZR_GAME_PATH")")
+            BZR_GAME_FLAVORS=("any")
+        else
+            echo "error: $BZR_GAME_PATH is not a Battlezone 98 Redux folder (no battlezone98redux.exe)." >&2
+        fi
     fi
 }
