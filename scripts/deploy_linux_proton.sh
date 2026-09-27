@@ -78,7 +78,12 @@ is_bzfile_dll() {
 
 is_bzfile_helper() {
     local path="$1"
-    [[ -f "$path" ]] && grep -a -q "bzfile replace helper" "$path"
+    # The helper's identifying text is a UTF-16 string literal, so drop the
+    # NUL bytes before matching. Every released helper carries it. grep -c
+    # reads the whole stream: an early-exiting grep -q would let tr die of
+    # SIGPIPE, which pipefail reports as a mismatch.
+    [[ -f "$path" ]] \
+        && LC_ALL=C tr -d '\000' <"$path" | grep -a -c -F "bzfile replace helper" >/dev/null
 }
 
 deploy_one() {
