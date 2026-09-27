@@ -3,6 +3,7 @@
 #include <wincrypt.h>
 
 #include <cstdlib>
+#include <exception>
 #include <filesystem>
 #include <fstream>
 #include <string>
@@ -10,8 +11,24 @@
 #include <vector>
 #include <iomanip>
 
+// bzfile_replace_helper.exe promotes OpenShim updates staged by bzfile.dll
+// once the game has exited. Two modes, both hash-verified:
+//
+//   <pid> <staged> <destination> <log> <sha256> <backup> <status>
+//   --suite <pid> <log> <status> then three groups of
+//       <staged> <destination> <sha256> <backup>
+//
+// Exit codes: 0 installed, 1 failed (status says why), 2 bad arguments,
+// 3 another helper already owns the update (its status is left alone).
+
 namespace
 {
+	constexpr wchar_t kUpdateMutexName[] = L"Local\\BZR_OpenShim_Update";
+	constexpr int kExitInstalled = 0;
+	constexpr int kExitFailed = 1;
+	constexpr int kExitBadArguments = 2;
+	constexpr int kExitAlreadyActive = 3;
+
 	struct CryptProvider
 	{
 		HCRYPTPROV handle = 0;
@@ -105,6 +122,13 @@ namespace
 		return stamp.str();
 	}
 
+	// Non-throwing existence check; the std::filesystem::exists overload
+	// without an error_code throws on anything but "not found".
+	bool FileExists(const std::filesystem::path& path)
+	{
+		return !path.empty() && GetFileAttributesW(path.c_str()) != INVALID_FILE_ATTRIBUTES;
+	}
+
 	void AppendLogLine(const std::filesystem::path& logPath, const std::wstring& message)
 	{
 		const std::string line = Utf8FromWide(TimestampNow() + L" " + message + L"\r\n");
@@ -195,20 +219,30 @@ namespace
 		}
 
 		std::vector<char> buffer(64 * 1024);
-		while (input.good())
+		for (;;)
 		{
 			input.read(buffer.data(), static_cast<std::streamsize>(buffer.size()));
 			const auto bytesRead = input.gcount();
-			if (bytesRead <= 0)
-			{
-				break;
-			}
-
-			if (!CryptHashData(hash.handle, reinterpret_cast<const BYTE*>(buffer.data()), static_cast<DWORD>(bytesRead), 0))
+			if (bytesRead > 0
+				&& !CryptHashData(hash.handle, reinterpret_cast<const BYTE*>(buffer.data()), static_cast<DWORD>(bytesRead), 0))
 			{
 				errorMessage = L"CryptHashData failed: " + FormatWindowsError(GetLastError());
 				return false;
 			}
+
+			if (!input)
+			{
+				break;
+			}
+		}
+
+		// A short read ends the loop with eofbit set; anything else (badbit
+		// without eof) is a read error, not the end of the file, and must not
+		// produce the hash of a truncated read.
+		if (!input.eof())
+		{
+			errorMessage = L"read error while hashing";
+			return false;
 		}
 
 		DWORD hashLength = 0;
@@ -236,26 +270,129 @@ namespace
 		return true;
 	}
 
-	bool RestoreBackup(
+	// Puts a copy of source at destination: copy beside the destination, then
+	// rename over it. The rename is atomic on one volume (and a POSIX rename
+	// under Wine), so the destination is either the old file or the complete
+	// new one. A direct MoveFileEx from the staging folder is not: the
+	// Workshop folder and the game can sit on different drives, where
+	// MOVEFILE_COPY_ALLOWED degrades to copy-then-delete. Retries cover a
+	// destination the exiting game still holds open for a moment.
+	bool InstallCopy(
+		const std::filesystem::path& sourcePath,
+		const std::filesystem::path& destinationPath,
+		const std::filesystem::path& logPath)
+	{
+		constexpr int kMaxAttempts = 120;
+		constexpr DWORD kDelayMilliseconds = 250;
+
+		std::filesystem::path temporaryPath = destinationPath;
+		temporaryPath += L".bzfile-promote";
+
+		if (!CopyFileW(sourcePath.c_str(), temporaryPath.c_str(), FALSE))
+		{
+			AppendLogLine(logPath, L"Could not copy " + sourcePath.wstring() + L" beside the destination: "
+				+ FormatWindowsError(GetLastError()));
+			DeleteFileW(temporaryPath.c_str());
+			return false;
+		}
+		SetFileAttributesW(temporaryPath.c_str(), FILE_ATTRIBUTE_NORMAL);
+
+		for (int attempt = 1; attempt <= kMaxAttempts; ++attempt)
+		{
+			SetFileAttributesW(destinationPath.c_str(), FILE_ATTRIBUTE_NORMAL);
+			if (MoveFileExW(
+				temporaryPath.c_str(),
+				destinationPath.c_str(),
+				MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH))
+			{
+				AppendLogLine(logPath, L"Installed " + destinationPath.wstring()
+					+ L" on attempt " + std::to_wstring(attempt) + L".");
+				return true;
+			}
+
+			const DWORD moveError = GetLastError();
+			if (attempt <= 5 || attempt == kMaxAttempts || attempt % 10 == 0)
+			{
+				AppendLogLine(logPath, L"Attempt " + std::to_wstring(attempt) + L" to replace "
+					+ destinationPath.wstring() + L" failed: " + FormatWindowsError(moveError));
+			}
+
+			Sleep(kDelayMilliseconds);
+		}
+
+		DeleteFileW(temporaryPath.c_str());
+		return false;
+	}
+
+	bool PromoteReplacement(
+		const std::filesystem::path& stagedPath,
+		const std::filesystem::path& destinationPath,
+		const std::filesystem::path& logPath)
+	{
+		if (!InstallCopy(stagedPath, destinationPath, logPath))
+		{
+			return false;
+		}
+
+		if (!DeleteFileW(stagedPath.c_str()))
+		{
+			AppendLogLine(logPath, L"Installed, but could not remove the staged file " + stagedPath.wstring()
+				+ L": " + FormatWindowsError(GetLastError()));
+		}
+		return true;
+	}
+
+	// Undoes one promotion: puts the backup back if the destination existed
+	// before, otherwise removes the file this update created. Restoring an
+	// unrelated older backup in the second case would install stale bytes.
+	bool UndoPromotion(
+		bool destinationExisted,
 		const std::filesystem::path& backupPath,
 		const std::filesystem::path& destinationPath,
 		const std::filesystem::path& logPath)
 	{
-		if (backupPath.empty() || !std::filesystem::exists(backupPath))
+		if (!destinationExisted)
 		{
-			AppendLogLine(logPath, L"No backup is available for rollback.");
+			SetFileAttributesW(destinationPath.c_str(), FILE_ATTRIBUTE_NORMAL);
+			if (!DeleteFileW(destinationPath.c_str()) && GetLastError() != ERROR_FILE_NOT_FOUND)
+			{
+				AppendLogLine(logPath, L"Rollback could not remove " + destinationPath.wstring() + L": "
+					+ FormatWindowsError(GetLastError()));
+				return false;
+			}
+			AppendLogLine(logPath, L"Removed newly installed " + destinationPath.wstring() + L".");
+			return true;
+		}
+
+		if (!FileExists(backupPath))
+		{
+			AppendLogLine(logPath, L"No backup is available to restore " + destinationPath.wstring() + L".");
 			return false;
 		}
 
+		if (!InstallCopy(backupPath, destinationPath, logPath))
+		{
+			AppendLogLine(logPath, L"Rollback could not restore " + destinationPath.wstring() + L".");
+			return false;
+		}
+
+		AppendLogLine(logPath, L"Restored previous " + destinationPath.wstring() + L".");
+		return true;
+	}
+
+	bool CreateBackup(
+		const std::filesystem::path& destinationPath,
+		const std::filesystem::path& backupPath,
+		const std::filesystem::path& logPath)
+	{
 		SetFileAttributesW(backupPath.c_str(), FILE_ATTRIBUTE_NORMAL);
-		SetFileAttributesW(destinationPath.c_str(), FILE_ATTRIBUTE_NORMAL);
-		if (!CopyFileW(backupPath.c_str(), destinationPath.c_str(), FALSE))
+		if (!CopyFileW(destinationPath.c_str(), backupPath.c_str(), FALSE))
 		{
-			AppendLogLine(logPath, L"Rollback copy failed: " + FormatWindowsError(GetLastError()));
+			AppendLogLine(logPath, L"Could not back up " + destinationPath.wstring() + L": "
+				+ FormatWindowsError(GetLastError()));
 			return false;
 		}
-
-		AppendLogLine(logPath, L"Restored previous OpenShim backup.");
+		AppendLogLine(logPath, L"Backed up " + destinationPath.wstring() + L" to " + backupPath.wstring() + L".");
 		return true;
 	}
 
@@ -263,14 +400,14 @@ namespace
 	{
 		if (processId == 0)
 		{
-			AppendLogLine(logPath, L"Skipping wait because process id was 0.");
-			return true;
+			AppendLogLine(logPath, L"No game process id was given.");
+			return false;
 		}
 
-		HANDLE process = OpenProcess(SYNCHRONIZE, FALSE, processId);
+		HANDLE process = OpenProcess(SYNCHRONIZE | PROCESS_QUERY_LIMITED_INFORMATION, FALSE, processId);
 		if (process == nullptr)
 		{
-			DWORD openError = GetLastError();
+			const DWORD openError = GetLastError();
 			if (openError == ERROR_INVALID_PARAMETER)
 			{
 				AppendLogLine(logPath, L"Process already exited before helper wait began.");
@@ -278,19 +415,33 @@ namespace
 				return true;
 			}
 
-			AppendLogLine(logPath, L"OpenProcess failed; continuing anyway: " + FormatWindowsError(openError));
+			AppendLogLine(logPath, L"OpenProcess failed: " + FormatWindowsError(openError));
 			return false;
 		}
 
-		// Bounded, not INFINITE. This helper holds the named update mutex for its
-		// whole lifetime, so a wait that never returns -- a recycled PID now
-		// belonging to a long-lived process, say -- would leave the mutex held
-		// forever and make every future update exit early as "already_staged",
-		// silently never installing anything again.
-		constexpr DWORD kMaxWaitMilliseconds = 10 * 60 * 1000;
+		// The game launches this helper, so the game was created first. A
+		// process with the same id created after the helper is a recycled id,
+		// which means the game has already gone. This is what makes the
+		// unbounded wait below safe: it can only be waiting on the game.
+		FILETIME targetCreated = {};
+		FILETIME helperCreated = {};
+		FILETIME unused[3] = {};
+		if (GetProcessTimes(process, &targetCreated, &unused[0], &unused[1], &unused[2])
+			&& GetProcessTimes(GetCurrentProcess(), &helperCreated, &unused[0], &unused[1], &unused[2])
+			&& CompareFileTime(&targetCreated, &helperCreated) > 0)
+		{
+			CloseHandle(process);
+			AppendLogLine(logPath, L"Process id " + std::to_wstring(processId)
+				+ L" now belongs to a newer process; the game has already exited.");
+			Sleep(1000);
+			return true;
+		}
 
+		// No timeout. A player can keep playing for hours after an update is
+		// staged; the previous 10-minute cap abandoned those updates.
 		AppendLogLine(logPath, L"Waiting for process " + std::to_wstring(processId) + L" to exit.");
-		DWORD waitResult = WaitForSingleObject(process, kMaxWaitMilliseconds);
+		const DWORD waitResult = WaitForSingleObject(process, INFINITE);
+		const DWORD waitError = GetLastError();
 		CloseHandle(process);
 
 		if (waitResult == WAIT_OBJECT_0)
@@ -300,62 +451,21 @@ namespace
 			return true;
 		}
 
-		if (waitResult == WAIT_TIMEOUT)
-		{
-			AppendLogLine(
-				logPath,
-				L"Timed out after 10 minutes waiting for process " + std::to_wstring(processId) +
-					L" to exit; abandoning this update so the next launch can retry.");
-			return false;
-		}
-
-		AppendLogLine(logPath, L"WaitForSingleObject failed: " + FormatWindowsError(GetLastError()));
+		AppendLogLine(logPath, L"WaitForSingleObject failed: " + FormatWindowsError(waitError));
 		return false;
 	}
 
-	bool PromoteReplacement(
-		const std::filesystem::path& stagedPath,
-		const std::filesystem::path& destinationPath,
-		const std::filesystem::path& logPath)
+	// Takes the update mutex. Returns false when another helper owns it; that
+	// helper also owns the status file, so this one must not write it.
+	bool AcquireUpdateMutex(ScopedHandle& mutex, const std::filesystem::path& logPath)
 	{
-		constexpr int kMaxAttempts = 120;
-		constexpr DWORD kDelayMilliseconds = 250;
-
-		for (int attempt = 1; attempt <= kMaxAttempts; ++attempt)
+		mutex.handle = CreateMutexW(nullptr, FALSE, kUpdateMutexName);
+		if (mutex.handle != nullptr && GetLastError() == ERROR_ALREADY_EXISTS)
 		{
-			SetFileAttributesW(stagedPath.c_str(), FILE_ATTRIBUTE_NORMAL);
-			SetFileAttributesW(destinationPath.c_str(), FILE_ATTRIBUTE_NORMAL);
-
-			if (MoveFileExW(
-				stagedPath.c_str(),
-				destinationPath.c_str(),
-				MOVEFILE_REPLACE_EXISTING | MOVEFILE_COPY_ALLOWED | MOVEFILE_WRITE_THROUGH))
-			{
-				if (std::filesystem::exists(stagedPath))
-				{
-					AppendLogLine(logPath, L"MoveFileExW returned success but staged file still exists.");
-					Sleep(kDelayMilliseconds);
-					continue;
-				}
-
-				AppendLogLine(logPath, L"Replacement succeeded on attempt " + std::to_wstring(attempt) + L".");
-				return true;
-			}
-
-			DWORD moveError = GetLastError();
-			if (attempt <= 5 || attempt == kMaxAttempts || attempt % 10 == 0)
-			{
-				std::wstringstream message;
-				message
-					<< L"Attempt " << attempt
-					<< L" failed: " << FormatWindowsError(moveError);
-				AppendLogLine(logPath, message.str());
-			}
-
-			Sleep(kDelayMilliseconds);
+			AppendLogLine(logPath, L"Another OpenShim update helper is already active; leaving its update alone.");
+			return false;
 		}
-
-		return false;
+		return true;
 	}
 
 	struct SuitePayload
@@ -367,42 +477,48 @@ namespace
 		bool destinationExisted = false;
 	};
 
+	// Rolls back the payloads that were actually promoted, newest first.
+	// Destinations that were never touched are not "restored": doing so used
+	// to report a correct rollback as incomplete whenever an untouched
+	// destination was locked.
 	bool RollBackSuite(
 		const std::vector<SuitePayload>& payloads,
+		size_t promotedCount,
 		const std::filesystem::path& logPath)
 	{
 		bool allRestored = true;
-		for (const auto& payload : payloads)
+		for (size_t index = promotedCount; index > 0; --index)
 		{
-			if (payload.destinationExisted)
+			const auto& payload = payloads[index - 1];
+			if (!UndoPromotion(payload.destinationExisted, payload.backupPath, payload.destinationPath, logPath))
 			{
-				if (!RestoreBackup(payload.backupPath, payload.destinationPath, logPath))
-				{
-					allRestored = false;
-				}
-			}
-			else
-			{
-				std::error_code removeError;
-				std::filesystem::remove(payload.destinationPath, removeError);
-				if (removeError)
-				{
-					AppendLogLine(logPath, L"Rollback removal failed for " + payload.destinationPath.wstring() + L": " +
-						L"error " + std::to_wstring(removeError.value()));
-					allRestored = false;
-				}
+				allRestored = false;
 			}
 		}
 		return allRestored;
+	}
+
+	void RemoveStagedFiles(const std::vector<SuitePayload>& payloads)
+	{
+		for (const auto& payload : payloads)
+		{
+			SetFileAttributesW(payload.stagedPath.c_str(), FILE_ATTRIBUTE_NORMAL);
+			DeleteFileW(payload.stagedPath.c_str());
+		}
 	}
 
 	int RunSuiteUpdate(const std::vector<std::wstring>& arguments)
 	{
 		// executable, --suite, pid, log, status, then three groups of
 		// staged/destination/hash/backup.
-		if (arguments.size() != 17 || arguments[1] != L"--suite")
+		if (arguments.size() != 17)
 		{
-			return 2;
+			if (arguments.size() >= 5)
+			{
+				WriteStatus(arguments[4], L"failed", L"",
+					L"helper received " + std::to_wstring(arguments.size()) + L" arguments; expected 17 (version mismatch?)");
+			}
+			return kExitBadArguments;
 		}
 
 		const DWORD processId = static_cast<DWORD>(wcstoul(arguments[2].c_str(), nullptr, 10));
@@ -422,27 +538,20 @@ namespace
 		const std::wstring suiteHash = payloads.front().expectedHash;
 
 		ScopedHandle updateMutex;
-		updateMutex.handle = CreateMutexW(nullptr, FALSE, L"Local\\BZR_OpenShim_Update");
-		if (updateMutex.handle == nullptr)
+		if (!AcquireUpdateMutex(updateMutex, logPath))
 		{
-			WriteStatus(statusPath, L"failed", suiteHash, L"could not create update mutex");
-			return 1;
-		}
-		if (GetLastError() == ERROR_ALREADY_EXISTS)
-		{
-			AppendLogLine(logPath, L"Another OpenShim update helper is already active.");
-			WriteStatus(statusPath, L"already_staged", suiteHash, L"another helper is active");
-			return 0;
+			return kExitAlreadyActive;
 		}
 
 		AppendLogLine(logPath, L"OpenShim suite update helper started.");
 		for (const auto& payload : payloads)
 		{
 			AppendLogLine(logPath, L"Validating staged payload: " + payload.stagedPath.wstring());
-			if (!std::filesystem::exists(payload.stagedPath))
+			if (!FileExists(payload.stagedPath))
 			{
 				WriteStatus(statusPath, L"failed", suiteHash, L"a staged suite payload is missing");
-				return 1;
+				RemoveStagedFiles(payloads);
+				return kExitFailed;
 			}
 
 			std::wstring stagedHash;
@@ -451,7 +560,8 @@ namespace
 			{
 				AppendLogLine(logPath, L"Staged suite payload hash validation failed: " + payload.stagedPath.wstring());
 				WriteStatus(statusPath, L"failed", suiteHash, L"staged suite payload hash mismatch");
-				return 1;
+				RemoveStagedFiles(payloads);
+				return kExitFailed;
 			}
 		}
 
@@ -459,9 +569,26 @@ namespace
 		if (!WaitForProcessExit(processId, logPath))
 		{
 			WriteStatus(statusPath, L"failed", suiteHash, L"could not wait for game process exit");
-			return 1;
+			RemoveStagedFiles(payloads);
+			return kExitFailed;
 		}
 
+		// The staged files sat in a script-writable folder while the game ran;
+		// check them again now that nothing else should be touching them.
+		for (const auto& payload : payloads)
+		{
+			std::wstring stagedHash;
+			std::wstring hashError;
+			if (!ComputeSha256(payload.stagedPath, stagedHash, hashError) || stagedHash != payload.expectedHash)
+			{
+				AppendLogLine(logPath, L"Staged suite payload changed while waiting: " + payload.stagedPath.wstring());
+				WriteStatus(statusPath, L"failed", suiteHash, L"a staged suite payload changed before promotion");
+				RemoveStagedFiles(payloads);
+				return kExitFailed;
+			}
+		}
+
+		WriteStatus(statusPath, L"promoting", suiteHash, L"backing up and installing the suite");
 		for (auto& payload : payloads)
 		{
 			std::error_code directoryError;
@@ -470,50 +597,158 @@ namespace
 			{
 				AppendLogLine(logPath, L"Could not create destination directory for " + payload.destinationPath.wstring());
 				WriteStatus(statusPath, L"failed", suiteHash, L"could not create destination directory");
-				return 1;
+				RemoveStagedFiles(payloads);
+				return kExitFailed;
 			}
 
-			payload.destinationExisted = std::filesystem::exists(payload.destinationPath);
-			if (payload.destinationExisted)
+			payload.destinationExisted = FileExists(payload.destinationPath);
+			if (payload.destinationExisted && !CreateBackup(payload.destinationPath, payload.backupPath, logPath))
 			{
-				SetFileAttributesW(payload.destinationPath.c_str(), FILE_ATTRIBUTE_NORMAL);
-				SetFileAttributesW(payload.backupPath.c_str(), FILE_ATTRIBUTE_NORMAL);
-				if (!CopyFileW(payload.destinationPath.c_str(), payload.backupPath.c_str(), FALSE))
-				{
-					const std::wstring backupError = FormatWindowsError(GetLastError());
-					AppendLogLine(logPath, L"Could not back up " + payload.destinationPath.wstring() + L": " + backupError);
-					WriteStatus(statusPath, L"failed", suiteHash, L"could not back up existing suite payload");
-					return 1;
-				}
+				WriteStatus(statusPath, L"failed", suiteHash, L"could not back up existing suite payload");
+				RemoveStagedFiles(payloads);
+				return kExitFailed;
 			}
 		}
 
+		size_t promotedCount = 0;
 		for (const auto& payload : payloads)
 		{
 			AppendLogLine(logPath, L"Promoting suite payload to: " + payload.destinationPath.wstring());
 			if (!PromoteReplacement(payload.stagedPath, payload.destinationPath, logPath))
 			{
-				const bool restored = RollBackSuite(payloads, logPath);
+				const bool restored = RollBackSuite(payloads, promotedCount, logPath);
+				RemoveStagedFiles(payloads);
 				WriteStatus(statusPath, L"failed", suiteHash,
 					restored ? L"suite promotion failed; previous files restored" : L"suite promotion failed; rollback incomplete");
-				return 1;
+				return kExitFailed;
 			}
+			++promotedCount;
 
 			std::wstring destinationHash;
 			std::wstring hashError;
 			if (!ComputeSha256(payload.destinationPath, destinationHash, hashError) || destinationHash != payload.expectedHash)
 			{
 				AppendLogLine(logPath, L"Installed suite payload hash validation failed: " + payload.destinationPath.wstring());
-				const bool restored = RollBackSuite(payloads, logPath);
+				const bool restored = RollBackSuite(payloads, promotedCount, logPath);
+				RemoveStagedFiles(payloads);
 				WriteStatus(statusPath, L"failed", suiteHash,
 					restored ? L"installed suite hash mismatch; previous files restored" : L"installed suite hash mismatch; rollback incomplete");
-				return 1;
+				return kExitFailed;
 			}
 		}
 
 		WriteStatus(statusPath, L"complete", suiteHash, L"all suite payloads installed and verified");
 		AppendLogLine(logPath, L"OpenShim suite update completed successfully.");
-		return 0;
+		return kExitInstalled;
+	}
+
+	int RunSingleUpdate(const std::vector<std::wstring>& arguments)
+	{
+		// executable, pid, staged, destination, log, hash, backup, status.
+		if (arguments.size() != 8)
+		{
+			return kExitBadArguments;
+		}
+
+		const DWORD processId = static_cast<DWORD>(wcstoul(arguments[1].c_str(), nullptr, 10));
+		const std::filesystem::path stagedPath(arguments[2]);
+		const std::filesystem::path destinationPath(arguments[3]);
+		const std::filesystem::path logPath(arguments[4]);
+		const std::wstring expectedHash = arguments[5];
+		const std::filesystem::path backupPath(arguments[6]);
+		const std::filesystem::path statusPath(arguments[7]);
+
+		ScopedHandle updateMutex;
+		if (!AcquireUpdateMutex(updateMutex, logPath))
+		{
+			return kExitAlreadyActive;
+		}
+
+		AppendLogLine(logPath, L"bzfile replace helper started.");
+		AppendLogLine(logPath, L"Staged: " + stagedPath.wstring());
+		AppendLogLine(logPath, L"Destination: " + destinationPath.wstring());
+
+		if (!FileExists(stagedPath))
+		{
+			AppendLogLine(logPath, L"Staged file is missing before replacement.");
+			WriteStatus(statusPath, L"failed", expectedHash, L"staged file is missing");
+			return kExitFailed;
+		}
+
+		std::wstring stagedHash;
+		std::wstring hashError;
+		if (!ComputeSha256(stagedPath, stagedHash, hashError) || stagedHash != expectedHash)
+		{
+			AppendLogLine(logPath, L"Staged payload hash validation failed: " + hashError);
+			WriteStatus(statusPath, L"failed", expectedHash, L"staged payload hash mismatch");
+			DeleteFileW(stagedPath.c_str());
+			return kExitFailed;
+		}
+		AppendLogLine(logPath, L"Staged payload SHA-256 verified: " + stagedHash);
+		WriteStatus(statusPath, L"waiting_for_exit", expectedHash, L"payload verified");
+
+		if (!WaitForProcessExit(processId, logPath))
+		{
+			WriteStatus(statusPath, L"failed", expectedHash, L"could not wait for game process exit");
+			DeleteFileW(stagedPath.c_str());
+			return kExitFailed;
+		}
+
+		if (!ComputeSha256(stagedPath, stagedHash, hashError) || stagedHash != expectedHash)
+		{
+			AppendLogLine(logPath, L"Staged payload changed while waiting.");
+			WriteStatus(statusPath, L"failed", expectedHash, L"staged payload changed before promotion");
+			DeleteFileW(stagedPath.c_str());
+			return kExitFailed;
+		}
+
+		WriteStatus(statusPath, L"promoting", expectedHash, L"backing up and installing");
+		const bool destinationExisted = FileExists(destinationPath);
+		if (destinationExisted && !CreateBackup(destinationPath, backupPath, logPath))
+		{
+			WriteStatus(statusPath, L"failed", expectedHash, L"could not create backup");
+			DeleteFileW(stagedPath.c_str());
+			return kExitFailed;
+		}
+
+		if (!PromoteReplacement(stagedPath, destinationPath, logPath))
+		{
+			AppendLogLine(logPath, L"Replacement failed after retries.");
+			WriteStatus(statusPath, L"failed", expectedHash, L"replacement failed after retries");
+			DeleteFileW(stagedPath.c_str());
+			return kExitFailed;
+		}
+
+		std::wstring destinationHash;
+		if (!ComputeSha256(destinationPath, destinationHash, hashError) || destinationHash != expectedHash)
+		{
+			AppendLogLine(logPath, L"Installed payload hash validation failed: " + hashError);
+			const bool restored = UndoPromotion(destinationExisted, backupPath, destinationPath, logPath);
+			WriteStatus(
+				statusPath,
+				L"failed",
+				expectedHash,
+				restored ? L"installed hash mismatch; previous version restored" : L"installed hash mismatch; rollback failed");
+			return kExitFailed;
+		}
+		AppendLogLine(logPath, L"Installed OpenShim SHA-256 verified: " + destinationHash);
+		WriteStatus(statusPath, L"complete", expectedHash, L"replacement verified");
+		AppendLogLine(logPath, L"bzfile replace helper completed successfully.");
+		return kExitInstalled;
+	}
+
+	// Where a failure can still be reported if something throws.
+	std::filesystem::path StatusPathFromArguments(const std::vector<std::wstring>& arguments)
+	{
+		if (arguments.size() >= 5 && arguments[1] == L"--suite")
+		{
+			return arguments[4];
+		}
+		if (arguments.size() == 8)
+		{
+			return arguments[7];
+		}
+		return {};
 	}
 }
 
@@ -523,118 +758,31 @@ int APIENTRY wWinMain(HINSTANCE, HINSTANCE, PWSTR, int)
 	LPWSTR* argv = CommandLineToArgvW(GetCommandLineW(), &argc);
 	if (argv == nullptr)
 	{
-		return 2;
+		return kExitBadArguments;
 	}
 
 	std::vector<std::wstring> arguments(argv, argv + argc);
 	LocalFree(argv);
-	if (arguments.size() > 1 && arguments[1] == L"--suite")
-	{
-		return RunSuiteUpdate(arguments);
-	}
 
-	const bool hardenedMode = arguments.size() == 8;
-	if (arguments.size() != 5 && !hardenedMode)
+	// Barrier: an escaping exception would end the helper with no status, and
+	// the game would keep reporting the update as pending.
+	try
 	{
-		return 2;
-	}
-
-	DWORD processId = static_cast<DWORD>(wcstoul(arguments[1].c_str(), nullptr, 10));
-	const std::filesystem::path stagedPath(arguments[2]);
-	const std::filesystem::path destinationPath(arguments[3]);
-	const std::filesystem::path logPath(arguments[4]);
-	const std::wstring expectedHash = hardenedMode ? arguments[5] : L"";
-	const std::filesystem::path backupPath = hardenedMode ? std::filesystem::path(arguments[6]) : std::filesystem::path();
-	const std::filesystem::path statusPath = hardenedMode ? std::filesystem::path(arguments[7]) : std::filesystem::path();
-
-	ScopedHandle updateMutex;
-	if (hardenedMode)
-	{
-		updateMutex.handle = CreateMutexW(nullptr, FALSE, L"Local\\BZR_OpenShim_Update");
-		if (updateMutex.handle == nullptr)
+		if (arguments.size() > 1 && arguments[1] == L"--suite")
 		{
-			WriteStatus(statusPath, L"failed", expectedHash, L"could not create update mutex");
-			return 1;
+			return RunSuiteUpdate(arguments);
 		}
-		if (GetLastError() == ERROR_ALREADY_EXISTS)
-		{
-			AppendLogLine(logPath, L"Another OpenShim update helper is already active.");
-			WriteStatus(statusPath, L"already_staged", expectedHash, L"another helper is active");
-			return 0;
-		}
+		return RunSingleUpdate(arguments);
 	}
-
-	AppendLogLine(logPath, L"bzfile replace helper started.");
-	AppendLogLine(logPath, L"Staged: " + stagedPath.wstring());
-	AppendLogLine(logPath, L"Destination: " + destinationPath.wstring());
-
-	if (!std::filesystem::exists(stagedPath))
+	catch (const std::exception& exception)
 	{
-		AppendLogLine(logPath, L"Staged file is missing before replacement.");
-		WriteStatus(statusPath, L"failed", expectedHash, L"staged file is missing");
-		return 1;
+		const std::string what = exception.what();
+		WriteStatus(StatusPathFromArguments(arguments), L"failed", L"",
+			L"helper error: " + std::wstring(what.begin(), what.end()));
 	}
-
-	if (hardenedMode)
+	catch (...)
 	{
-		std::wstring stagedHash;
-		std::wstring hashError;
-		if (!ComputeSha256(stagedPath, stagedHash, hashError) || stagedHash != expectedHash)
-		{
-			AppendLogLine(logPath, L"Staged payload hash validation failed: " + hashError);
-			WriteStatus(statusPath, L"failed", expectedHash, L"staged payload hash mismatch");
-			return 1;
-		}
-		AppendLogLine(logPath, L"Staged payload SHA-256 verified: " + stagedHash);
-		WriteStatus(statusPath, L"waiting_for_exit", expectedHash, L"payload verified");
+		WriteStatus(StatusPathFromArguments(arguments), L"failed", L"", L"helper error");
 	}
-
-	if (!WaitForProcessExit(processId, logPath))
-	{
-		WriteStatus(statusPath, L"failed", expectedHash, L"could not wait for game process exit");
-		return 1;
-	}
-
-	if (hardenedMode && std::filesystem::exists(destinationPath))
-	{
-		SetFileAttributesW(destinationPath.c_str(), FILE_ATTRIBUTE_NORMAL);
-		SetFileAttributesW(backupPath.c_str(), FILE_ATTRIBUTE_NORMAL);
-		if (!CopyFileW(destinationPath.c_str(), backupPath.c_str(), FALSE))
-		{
-			const std::wstring backupError = FormatWindowsError(GetLastError());
-			AppendLogLine(logPath, L"Could not create OpenShim backup: " + backupError);
-			WriteStatus(statusPath, L"failed", expectedHash, L"could not create backup: " + backupError);
-			return 1;
-		}
-		AppendLogLine(logPath, L"Backed up current OpenShim to: " + backupPath.wstring());
-	}
-
-	if (!PromoteReplacement(stagedPath, destinationPath, logPath))
-	{
-		AppendLogLine(logPath, L"Replacement failed after retries.");
-		WriteStatus(statusPath, L"failed", expectedHash, L"replacement failed after retries");
-		return 1;
-	}
-
-	if (hardenedMode)
-	{
-		std::wstring destinationHash;
-		std::wstring hashError;
-		if (!ComputeSha256(destinationPath, destinationHash, hashError) || destinationHash != expectedHash)
-		{
-			AppendLogLine(logPath, L"Installed payload hash validation failed: " + hashError);
-			const bool restored = RestoreBackup(backupPath, destinationPath, logPath);
-			WriteStatus(
-				statusPath,
-				L"failed",
-				expectedHash,
-				restored ? L"installed hash mismatch; previous version restored" : L"installed hash mismatch; rollback failed");
-			return 1;
-		}
-		AppendLogLine(logPath, L"Installed OpenShim SHA-256 verified: " + destinationHash);
-		WriteStatus(statusPath, L"complete", expectedHash, L"replacement verified");
-	}
-
-	AppendLogLine(logPath, L"bzfile replace helper completed successfully.");
-	return 0;
+	return kExitFailed;
 }

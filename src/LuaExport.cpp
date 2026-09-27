@@ -449,20 +449,40 @@ namespace File
 			startupInfo.wShowWindow = SW_HIDE;
 
 			PROCESS_INFORMATION processInfo = {};
+			// GOG Galaxy can place the game and its children in a job object.
+			// Without breakaway, the replacement helper is terminated with the
+			// game before it can promote the pending DLL.
 			BOOL created = CreateProcessW(
 				executable.c_str(),
 				mutableCommand.data(),
 				nullptr,
 				nullptr,
 				FALSE,
-				// GOG Galaxy can place the game and its children in a job object.
-				// Without breakaway, the replacement helper is terminated with the
-				// game before it can promote the pending DLL.
 				CREATE_NO_WINDOW | DETACHED_PROCESS | CREATE_BREAKAWAY_FROM_JOB,
 				nullptr,
 				nullptr,
 				&startupInfo,
 				&processInfo);
+			if (!created && GetLastError() == ERROR_ACCESS_DENIED)
+			{
+				// A job without JOB_OBJECT_LIMIT_BREAKAWAY_OK refuses the
+				// breakaway flag outright. Launching inside the job is better
+				// than not launching at all: the helper still installs if the
+				// job outlives the game, and fails visibly if it does not.
+				mutableCommand.assign(commandLine.begin(), commandLine.end());
+				mutableCommand.push_back(L'\0');
+				created = CreateProcessW(
+					executable.c_str(),
+					mutableCommand.data(),
+					nullptr,
+					nullptr,
+					FALSE,
+					CREATE_NO_WINDOW | DETACHED_PROCESS,
+					nullptr,
+					nullptr,
+					&startupInfo,
+					&processInfo);
+			}
 			if (!created)
 			{
 				errorMessage = NarrowSystemError(GetLastError());
@@ -472,6 +492,38 @@ namespace File
 			CloseHandle(processInfo.hThread);
 			CloseHandle(processInfo.hProcess);
 			return true;
+		}
+
+		// Held by bzfile_replace_helper.exe for as long as it owns an OpenShim
+		// update (waiting for the game to exit, then promoting).
+		constexpr wchar_t kUpdateMutexName[] = L"Local\\BZR_OpenShim_Update";
+
+		bool IsUpdateHelperActive()
+		{
+			HANDLE mutex = OpenMutexW(SYNCHRONIZE, FALSE, kUpdateMutexName);
+			if (mutex == nullptr)
+			{
+				return false;
+			}
+			CloseHandle(mutex);
+			return true;
+		}
+
+		// The staging functions write "staged" before launching the helper,
+		// because the helper overwrites the status as soon as it starts. If
+		// the launch fails no helper will ever update it, so say so here; a
+		// status left at "staged" reads as "restart required" forever.
+		void WriteLaunchFailureStatus(
+			const std::filesystem::path& statusPath,
+			const std::string& expectedHash,
+			const std::string& reason)
+		{
+			std::ofstream status(statusPath, std::ios::trunc);
+			if (status.is_open())
+			{
+				status << "state=failed\nexpected_sha256=" << expectedHash
+					<< "\ndetail=could not launch update helper: " << reason << "\n";
+			}
 		}
 
 		// Exception barrier around every registered function. The game's Lua
@@ -1256,6 +1308,16 @@ namespace File
 			return 2;
 		}
 
+		// A helper already owns an update and the status file. Staging again
+		// would start a second helper that can only step aside, and would
+		// overwrite the status the first one is still reporting through.
+		if (IsUpdateHelperActive())
+		{
+			lua_pushboolean(L, 0);
+			lua_pushstring(L, "an OpenShim update is already staged; it installs when the game exits");
+			return 2;
+		}
+
 		error.clear();
 		std::filesystem::copy_file(sourcePath, stagedPath, std::filesystem::copy_options::overwrite_existing, error);
 		if (error)
@@ -1287,6 +1349,7 @@ namespace File
 		if (!LaunchHiddenProcess(helperPath.wstring(), arguments, launchError))
 		{
 			std::filesystem::remove(stagedPath, error);
+			WriteLaunchFailureStatus(statusPath, expectedHash, launchError);
 			lua_pushboolean(L, 0);
 			lua_pushfstring(L, "could not launch OpenShim update helper: %s", launchError.c_str());
 			return 2;
@@ -1438,6 +1501,14 @@ namespace File
 			return 2;
 		}
 
+		// See StageOpenShimUpdate: never stage over a helper that is running.
+		if (IsUpdateHelperActive())
+		{
+			lua_pushboolean(L, 0);
+			lua_pushstring(L, "an OpenShim update is already staged; it installs when the game exits");
+			return 2;
+		}
+
 		for (size_t index = 0; index < payloads.size(); ++index)
 		{
 			error.clear();
@@ -1490,6 +1561,7 @@ namespace File
 			{
 				std::filesystem::remove(payload.staged, error);
 			}
+			WriteLaunchFailureStatus(statusPath, payloads[0].expectedHash, launchError);
 			lua_pushboolean(L, 0);
 			lua_pushfstring(L, "could not launch OpenShim suite update helper: %s", launchError.c_str());
 			return 2;
@@ -1616,6 +1688,16 @@ namespace File
 		return 1;
 	}
 
+	// True while bzfile_replace_helper.exe owns an OpenShim update. A status
+	// file that still says "staged" or "waiting_for_exit" while this is false
+	// was left by a helper that never finished (crash, kill, power loss) and
+	// is stale: the update can be staged again.
+	static int IsOpenShimUpdateActive(lua_State* L)
+	{
+		lua_pushboolean(L, IsUpdateHelperActive() ? 1 : 0);
+		return 1;
+	}
+
 	// Write protection can no longer be switched off from Lua. The old flag
 	// disabled it process-wide, for bzfile.dll itself and for Delete's scan,
 	// and nothing used it. Both exports stay so a probing script gets a clear
@@ -1692,6 +1774,7 @@ extern "C" int __declspec(dllexport) luaopen_bzfile(lua_State* L)
 		{ "GetFileVersion", &File::Guarded<&File::GetFileVersion> },
 		{ "StageOpenShimUpdate", &File::Guarded<&File::StageOpenShimUpdate> },
 		{ "StageOpenShimSuiteUpdate", &File::Guarded<&File::StageOpenShimSuiteUpdate> },
+		{ "IsOpenShimUpdateActive", &File::Guarded<&File::IsOpenShimUpdateActive> },
 		{ "Delete", &File::Guarded<&File::Delete> },
 		{ "ListDirectory", &File::Guarded<&File::ListDirectory> },
 		{ "SetAllowWinmmOverwrite", &File::Guarded<&File::SetAllowWinmmOverwrite> },
