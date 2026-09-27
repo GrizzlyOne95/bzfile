@@ -298,6 +298,57 @@ test_reinstall_over_existing() {
     pass "re-install replaces our own helper and refuses a foreign one"
 }
 
+# An explicit game path must be a game folder, like an auto-detected one.
+test_game_path_must_be_a_game() {
+    local home not_game artifacts out status
+    home="$(workdir gamepathhome)"
+    not_game="$(workdir notagame)"
+    artifacts="$(workdir gamepathartifacts)"
+    make_stub_binaries "$artifacts"
+
+    status=0
+    out="$(run_installer "$home" --game-path "$not_game" --dll "$artifacts/bzfile.dll")" || status=$?
+    [[ $status -ne 0 ]] || fail "--game-path accepted a folder without the game: $out"
+    [[ ! -e "$not_game/bzfile.dll" ]] || fail "--game-path deployed into a non-game folder"
+    pass "--game-path requires a game folder"
+}
+
+# Backups are capped, --uninstall removes only our files, and the deploy
+# script (now a wrapper) still works with its original arguments.
+test_backups_uninstall_and_deploy_wrapper() {
+    local home game artifacts out status stamp count
+    home="$(workdir lifecyclehome)"
+    game="$(workdir lifecyclegame)"
+    make_game_dir "$game"
+    artifacts="$(workdir lifecycleartifacts)"
+    make_stub_binaries "$artifacts"
+
+    status=0
+    out="$(env -u BZR_GAME_PATH -u STEAM_ROOT HOME="$home" \
+        "$ROOT/scripts/deploy_linux_proton.sh" "$game" "$artifacts/bzfile.dll" 2>&1)" || status=$?
+    [[ $status -eq 0 && -s "$game/bzfile.dll" && -s "$game/bzfile_replace_helper.exe" ]] \
+        || fail "deploy_linux_proton.sh GAME_DIR DLL_PATH failed (exit $status): $out"
+
+    for stamp in 20260101-000001 20260101-000002 20260101-000003 20260101-000004 20260101-000005; do
+        cp "$game/bzfile.dll" "$game/bzfile.dll.bak-$stamp"
+    done
+    run_installer "$home" --game-path "$game" --dll "$artifacts/bzfile.dll" >/dev/null \
+        || fail "re-install for backup pruning failed"
+    count="$(find "$game" -maxdepth 1 -name 'bzfile.dll.bak-*' | wc -l)"
+    [[ "$count" -eq 3 ]] || fail "expected 3 bzfile.dll backups after pruning, found $count"
+    [[ ! -e "$game/bzfile.dll.bak-20260101-000001" ]] || fail "pruning kept the oldest backup"
+    [[ ! -e "$game/bzfile.dll.installing" ]] || fail "install left a staging file behind"
+
+    printf 'not ours\n' >"$game/bzfile_replace_helper.exe"
+    run_installer "$home" --game-path "$game" --uninstall >/dev/null || fail "--uninstall failed"
+    [[ ! -e "$game/bzfile.dll" ]] || fail "--uninstall kept bzfile.dll"
+    [[ -z "$(find "$game" -maxdepth 1 -name 'bzfile.dll.bak-*')" ]] || fail "--uninstall kept DLL backups"
+    [[ -e "$game/bzfile_replace_helper.exe" ]] || fail "--uninstall removed a foreign helper"
+    [[ -e "$game/battlezone98redux.exe" ]] || fail "--uninstall touched the game"
+
+    pass "backups are capped, --uninstall removes only bzfile's files, deploy wrapper works"
+}
+
 test_version_header
 test_write_policy
 test_script_syntax
@@ -308,5 +359,7 @@ test_symlink_aliases_dedupe
 test_external_library_flavours
 test_flavour_filter_uses_discovering_root
 test_reinstall_over_existing
+test_game_path_must_be_a_game
+test_backups_uninstall_and_deploy_wrapper
 
 echo "All Linux host checks passed."

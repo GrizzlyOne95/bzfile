@@ -13,15 +13,20 @@ REF="${BZFILE_REF:-main}"
 FLAVOR="all"
 GAME_PATH="${BZR_GAME_PATH:-}"
 DLL_PATH="${BZFILE_DLL:-}"
+UNINSTALL=0
 
 usage() {
     cat <<EOF
 Usage:
-  install_linux.sh [--native | --snap] [--game-path DIR] [--dll FILE] [--ref git-ref]
+  install_linux.sh [--native | --snap] [--game-path DIR] [--dll FILE] [--ref git-ref] [--uninstall]
 
     --native      Native Steam and Flatpak installs only
     --snap        Snap Steam installs only
-    --game-path   One game directory (overrides flavour filter)
+    --game-path   One game directory (overrides flavour filter). Must contain
+                  battlezone98redux.exe. Use this for GOG under Wine, e.g.
+                  "\$WINEPREFIX/drive_c/GOG Games/Battlezone 98 Redux".
+    --uninstall   Remove bzfile.dll, the helper and their backups instead of
+                  installing (only files that identify as bzfile's own)
     --dll         Advanced: Win32 bzfile.dll. Requires bzfile_replace_helper.exe
                   in the same directory.
     --ref         Git ref used only to fetch steam_game_paths.sh (default: $REF)
@@ -193,10 +198,54 @@ deploy_matched() {
     if [[ -f "$dest_helper" ]]; then
         cp -f "$dest_helper" "$dest_helper.bak-$stamp"
     fi
-    cp -f "$dll" "$dest_dll"
-    cp -f "$helper" "$dest_helper"
+
+    # Stage both files beside their destinations first, then rename them into
+    # place, so a failed copy never leaves a truncated DLL or a new DLL with
+    # an old helper.
+    cp -f "$dll" "$dest_dll.installing"
+    cp -f "$helper" "$dest_helper.installing"
+    mv -f "$dest_dll.installing" "$dest_dll"
+    mv -f "$dest_helper.installing" "$dest_helper"
+    prune_backups "$dest_dll"
+    prune_backups "$dest_helper"
     echo "  deployed bzfile.dll ($(stat -c %s "$dest_dll") bytes)"
     echo "  deployed bzfile_replace_helper.exe ($(stat -c %s "$dest_helper") bytes)"
+}
+
+# Keep the newest few timestamped backups; every install used to add two
+# files to the game folder forever. The stamps sort chronologically.
+KEEP_BACKUPS=3
+prune_backups() {
+    local file="$1" old
+    local backups=()
+    shopt -s nullglob
+    backups=("$file".bak-*)
+    shopt -u nullglob
+    if ((${#backups[@]} > KEEP_BACKUPS)); then
+        while IFS= read -r old; do
+            rm -f -- "$old"
+        done < <(printf '%s\n' "${backups[@]}" | sort | head -n "$((${#backups[@]} - KEEP_BACKUPS))")
+    fi
+}
+
+# Removes only files that identify as bzfile's own, plus their backups.
+uninstall_from() {
+    local game_dir="$1" name path
+    echo "Removing bzfile from: $game_dir"
+    for name in bzfile.dll bzfile_replace_helper.exe; do
+        path="$game_dir/$name"
+        [[ -f "$path" ]] || continue
+        if [[ "$name" == bzfile.dll ]] && ! is_bzfile_dll "$path"; then
+            echo "  kept $name: it is not a bzfile build" >&2
+            continue
+        fi
+        if [[ "$name" == bzfile_replace_helper.exe ]] && ! is_bzfile_helper "$path"; then
+            echo "  kept $name: it is not a bzfile build" >&2
+            continue
+        fi
+        rm -f -- "$path" "$path".bak-* "$path.installing"
+        echo "  removed $name"
+    done
 }
 
 while [[ $# -gt 0 ]]; do
@@ -218,6 +267,7 @@ while [[ $# -gt 0 ]]; do
             REF="$2"
             shift 2
             ;;
+        --uninstall) UNINSTALL=1; shift ;;
         -h|--help)
             usage
             exit 0
@@ -266,6 +316,15 @@ if [[ ${#BZR_GAME_PATHS[@]} -eq 0 ]]; then
         snap) echo "Use the Native/Flatpak paste command if you are not on Snap Steam." >&2 ;;
     esac
     exit 1
+fi
+
+if [[ "$UNINSTALL" -eq 1 ]]; then
+    for game_dir in "${BZR_GAME_PATHS[@]}"; do
+        uninstall_from "$game_dir"
+    done
+    echo
+    echo "Uninstall complete."
+    exit 0
 fi
 
 dll=""
