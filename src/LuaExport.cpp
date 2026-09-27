@@ -3,20 +3,29 @@
 #include <Windows.h>
 #include <wincrypt.h>
 
+#include <algorithm>
+#include <cstdio>
+#include <cstring>
 #include <filesystem>
 #include <fstream>
 #include <cwctype>
+#include <new>
 #include <string>
 #include <system_error>
 #include <sstream>
 #include <iomanip>
 #include <vector>
 
+#include "bzfile_write_policy.h"
+
 namespace File
 {
 	namespace
 	{
-		bool g_AllowWinmmOverwrite = false;
+		// Upper bound for a single Read or Dump. The game is a 32-bit process;
+		// an unbounded request used to be allocated up front and could throw
+		// bad_alloc straight into the engine.
+		constexpr size_t kMaxReadBytes = 64u * 1024u * 1024u;
 
 		std::wstring ToLower(std::wstring value)
 		{
@@ -25,6 +34,65 @@ namespace File
 				ch = static_cast<wchar_t>(towlower(ch));
 			}
 			return value;
+		}
+
+		// Lua strings reach std::filesystem::path as ANSI (the active code
+		// page), so paths handed back to Lua use the same encoding. The
+		// conversion reports, rather than throws on, characters the code page
+		// cannot represent: path::string() throws system_error there, which
+		// used to escape into the game.
+		std::string ToAnsi(const std::wstring& wide, bool* lossy)
+		{
+			if (lossy != nullptr)
+			{
+				*lossy = false;
+			}
+			if (wide.empty())
+			{
+				return {};
+			}
+
+			// With a UTF-8 active code page every character maps, and
+			// WideCharToMultiByte rejects the default-char arguments.
+			const bool detectLoss = GetACP() != CP_UTF8;
+			const DWORD flags = detectLoss ? WC_NO_BEST_FIT_CHARS : 0;
+			BOOL usedDefault = FALSE;
+			BOOL* usedDefaultOut = detectLoss ? &usedDefault : nullptr;
+
+			const int wideLength = static_cast<int>(wide.size());
+			const int size = WideCharToMultiByte(
+				CP_ACP, flags, wide.data(), wideLength, nullptr, 0, nullptr, usedDefaultOut);
+			if (size <= 0)
+			{
+				if (lossy != nullptr)
+				{
+					*lossy = true;
+				}
+				return {};
+			}
+
+			std::string narrow(static_cast<size_t>(size), '\0');
+			WideCharToMultiByte(
+				CP_ACP, flags, wide.data(), wideLength, narrow.data(), size, nullptr, usedDefaultOut);
+			if (lossy != nullptr && usedDefault)
+			{
+				*lossy = true;
+			}
+			return narrow;
+		}
+
+		// For messages only: unmappable characters become '?'.
+		std::string DisplayPath(const std::filesystem::path& path)
+		{
+			return ToAnsi(path.native(), nullptr);
+		}
+
+		// For paths returned to Lua, which must open again through bzfile.
+		bool TryNarrowPath(const std::filesystem::path& path, std::string& narrow)
+		{
+			bool lossy = false;
+			narrow = ToAnsi(path.native(), &lossy);
+			return !lossy;
 		}
 
 		std::filesystem::path NormalizePath(const std::filesystem::path& path)
@@ -139,7 +207,11 @@ namespace File
 			std::filesystem::path steamapps = FindSteamAppsDirectory(bzrRoot);
 			if (steamapps.empty())
 			{
-				steamapps = bzrRoot.parent_path().parent_path();
+				// Not a Steam install (GOG, or a copied game folder). There is
+				// no Workshop directory to find, and guessing one two levels up
+				// -- C:\Program Files (x86)\GOG Galaxy\workshop\... for GOG --
+				// only turned an unrelated directory into an allowed write root.
+				return {};
 			}
 			return NormalizePath(steamapps / "workshop" / "content" / "301650");
 		}
@@ -242,7 +314,7 @@ namespace File
 			}
 
 			outError = "bzfile Error: refusing to access path outside allowed roots. Path: \""
-				+ normalizedPath.string() + "\"";
+				+ DisplayPath(normalizedPath) + "\"";
 			return false;
 		}
 
@@ -336,20 +408,18 @@ namespace File
 			}
 		}
 
+		// The one write-protection check (see .jules/sentinel.md): every binding
+		// that creates, overwrites, copies onto or deletes a path calls it. The
+		// rule itself lives in bzfile_write_policy.h. It cannot be switched off
+		// from Lua; SetAllowWinmmOverwrite used to disable it process-wide.
 		bool IsWriteProtected(const std::filesystem::path& path)
 		{
-			if (g_AllowWinmmOverwrite)
-			{
-				return false;
-			}
+			return bzfile::policy::IsProtectedLeafName(path.filename().native());
+		}
 
-			auto fileName = ToLower(path.filename().wstring());
-			if (fileName == L"winmm.dll" || fileName == L"bzfile.dll")
-			{
-				return true;
-			}
-
-			return false;
+		bool SamePath(const std::filesystem::path& left, const std::filesystem::path& right)
+		{
+			return ToLower(NormalizePath(left).wstring()) == ToLower(NormalizePath(right).wstring());
 		}
 
 		std::string NarrowSystemError(DWORD errorCode)
@@ -402,6 +472,37 @@ namespace File
 			CloseHandle(processInfo.hThread);
 			CloseHandle(processInfo.hProcess);
 			return true;
+		}
+
+		// Exception barrier around every registered function. The game's Lua
+		// core is C, so a C++ exception leaving a binding (bad_alloc on a large
+		// read, filesystem_error, system_error from a path conversion) has no
+		// handler above it and takes the game down. A caught exception becomes
+		// the usual nil + message result instead. The message is copied into
+		// a local buffer inside the handler so no Lua call runs there.
+		template <lua_CFunction Binding>
+		int Guarded(lua_State* L)
+		{
+			char message[512] = "bzfile Error: unexpected internal error";
+			try
+			{
+				return Binding(L);
+			}
+			catch (const std::bad_alloc&)
+			{
+				strcpy_s(message, "bzfile Error: out of memory");
+			}
+			catch (const std::exception& exception)
+			{
+				_snprintf_s(message, _TRUNCATE, "bzfile Error: %s", exception.what());
+			}
+			catch (...)
+			{
+			}
+
+			lua_pushnil(L);
+			lua_pushstring(L, message);
+			return 2;
 		}
 	}
 
@@ -457,7 +558,7 @@ namespace File
 			if (IsWriteProtected(filePath))
 			{
 				return PushPathRejectionNil(
-					L, "bzfile Error: file is write-protected: \"" + filePath.string() + "\"");
+					L, "bzfile Error: file is write-protected: \"" + DisplayPath(filePath) + "\"");
 			}
 
 			if (options == "app")
@@ -489,7 +590,7 @@ namespace File
 		if (!fs->is_open())
 		{
 			lua_pushnil(L);
-			lua_pushfstring(L, "bzfile Error: could not open file \"%s\"", filePath.string().c_str());
+			lua_pushfstring(L, "bzfile Error: could not open file \"%s\"", DisplayPath(filePath).c_str());
 			return 2;
 		}
 
@@ -538,7 +639,9 @@ namespace File
 		std::fstream* handle = (std::fstream*)luaL_checkudata(L, 1, "FileMetatable");
 		if (!handle->is_open()) return luaL_error(L, "bzfile Error: file is not open");
 
-		int count = luaL_optint(L, 2, 1);
+		const lua_Integer count = luaL_optinteger(L, 2, 1);
+		luaL_argcheck(L, count <= static_cast<lua_Integer>(kMaxReadBytes), 2,
+			"count exceeds the 64 MiB read limit");
 
 		if (handle->eof())
 		{
@@ -559,23 +662,39 @@ namespace File
 			}
 			return 1;
 		}
+
+		// Read in chunks so memory follows what the file actually holds, not
+		// the count the script asked for.
+		std::string content;
+		std::vector<char> chunk(static_cast<size_t>((std::min)(count, static_cast<lua_Integer>(64 * 1024))));
+		size_t remaining = static_cast<size_t>(count);
+		while (remaining > 0)
+		{
+			const size_t wanted = (std::min)(remaining, chunk.size());
+			handle->read(chunk.data(), static_cast<std::streamsize>(wanted));
+			const auto bytesRead = handle->gcount();
+			if (bytesRead <= 0)
+			{
+				break;
+			}
+
+			content.append(chunk.data(), static_cast<size_t>(bytesRead));
+			remaining -= static_cast<size_t>(bytesRead);
+			if (static_cast<size_t>(bytesRead) < wanted)
+			{
+				break;
+			}
+		}
+
+		if (content.empty())
+		{
+			lua_pushnil(L);
+		}
 		else
 		{
-			std::vector<char> buffer(count);
-			handle->read(buffer.data(), count);
-
-			auto bytesRead = handle->gcount();
-
-			if (bytesRead > 0)
-			{
-				lua_pushlstring(L, buffer.data(), (size_t)bytesRead);
-			}
-			else
-			{
-				lua_pushnil(L);
-			}
-			return 1;
+			lua_pushlstring(L, content.data(), content.size());
 		}
+		return 1;
 	}
 
 	static int Readln(lua_State* L)
@@ -617,9 +736,23 @@ namespace File
 			return 1;
 		}
 
+		if (static_cast<unsigned long long>(size) > kMaxReadBytes)
+		{
+			lua_pushnil(L);
+			lua_pushstring(L, "bzfile Error: file exceeds the 64 MiB Dump limit");
+			return 2;
+		}
+
+		// tellg() counts raw bytes, but a text-mode handle (the default, "r")
+		// turns CRLF into LF and stops at 0x1A, so fewer bytes arrive than
+		// were reserved. Keep only what was read: the unused tail used to be
+		// returned as NUL padding, one byte per line. A handle opened for
+		// writing only reads nothing and returns "".
 		std::string content;
 		content.resize(static_cast<size_t>(size));
-		handle->read(content.data(), size);
+		handle->read(content.data(), static_cast<std::streamsize>(size));
+		const auto bytesRead = handle->gcount();
+		content.resize(bytesRead > 0 ? static_cast<size_t>(bytesRead) : 0);
 
 		lua_pushlstring(L, content.data(), content.size());
 		return 1;
@@ -648,13 +781,30 @@ namespace File
 
 	static int GetWorkingDirectory(lua_State* L)
 	{
-		lua_pushstring(L, GetWorkingDirectoryPath().string().c_str());
+		std::string directory;
+		if (!TryNarrowPath(GetWorkingDirectoryPath(), directory))
+		{
+			lua_pushnil(L);
+			lua_pushstring(L, "bzfile Error: the game directory cannot be represented in the system code page");
+			return 2;
+		}
+
+		lua_pushlstring(L, directory.data(), directory.size());
 		return 1;
 	}
 
+	// "" when the game is not a Steam install (no Workshop directory exists).
 	static int GetWorkshopDirectory(lua_State* L)
 	{
-		lua_pushstring(L, GetWorkshopDirectoryPath().string().c_str());
+		std::string directory;
+		if (!TryNarrowPath(GetWorkshopDirectoryPath(), directory))
+		{
+			lua_pushnil(L);
+			lua_pushstring(L, "bzfile Error: the Workshop directory cannot be represented in the system code page");
+			return 2;
+		}
+
+		lua_pushlstring(L, directory.data(), directory.size());
 		return 1;
 	}
 
@@ -667,6 +817,14 @@ namespace File
 		if (!TryResolveAllowedPath(requestedPath, directory, pathError))
 		{
 			return PushPathRejectionFalse(L, pathError);
+		}
+
+		// A directory under a protected name would block the real file from
+		// ever being written there (a "winmm.dll" folder in the game root).
+		if (IsWriteProtected(directory))
+		{
+			return PushPathRejectionFalse(
+				L, "bzfile Error: path is write-protected: \"" + DisplayPath(directory) + "\"");
 		}
 
 		std::error_code error;
@@ -718,138 +876,80 @@ namespace File
 
 		if (IsWriteProtected(destinationPath))
 		{
-			lua_pushboolean(L, 0);
-			lua_pushfstring(L, "bzfile Error: destination is write-protected: \"%s\"", destinationPath.string().c_str());
-			return 2;
+			return PushPathRejectionFalse(
+				L, "bzfile Error: destination is write-protected: \"" + DisplayPath(destinationPath) + "\"");
 		}
 
-		bool overwriteExisting = lua_toboolean(L, 3) != 0;
+		const bool overwriteExisting = lua_toboolean(L, 3) != 0;
+
+		if (SamePath(sourcePath, destinationPath))
+		{
+			return PushPathRejectionFalse(L, "bzfile Error: source and destination are the same file");
+		}
 
 		std::error_code error;
-		auto copyOptions = overwriteExisting
-			? std::filesystem::copy_options::overwrite_existing
-			: std::filesystem::copy_options::none;
-
-		if (overwriteExisting && std::filesystem::exists(destinationPath, error))
+		if (!std::filesystem::is_regular_file(sourcePath, error))
 		{
-			error.clear();
+			return PushPathRejectionFalse(
+				L, "bzfile Error: source is not a readable file: \"" + DisplayPath(sourcePath) + "\"");
+		}
 
-			// Best-effort force replace for existing shims: clear common blocking
-			// attributes and remove the old file before copying the new one in.
-			auto destinationWide = destinationPath.wstring();
-			SetFileAttributesW(destinationWide.c_str(), FILE_ATTRIBUTE_NORMAL);
+		// Copy beside the destination first and rename it into place, so the
+		// destination is untouched until a complete copy exists. The old code
+		// deleted the destination before copying: a missing or unreadable
+		// source (or CopyFile(p, p, true)) destroyed it. The rename is atomic
+		// on NTFS and a POSIX rename under Wine.
+		std::filesystem::path temporaryPath = destinationPath;
+		temporaryPath += L".bzfile-copy";
 
-			std::error_code removeError;
-			if (std::filesystem::remove(destinationPath, removeError))
+		if (!CopyFileW(sourcePath.c_str(), temporaryPath.c_str(), FALSE))
+		{
+			const DWORD copyError = GetLastError();
+			DeleteFileW(temporaryPath.c_str());
+			return PushPathRejectionFalse(L, "bzfile Error: copy failed: " + NarrowSystemError(copyError));
+		}
+
+		DWORD moveFlags = MOVEFILE_WRITE_THROUGH;
+		if (overwriteExisting)
+		{
+			moveFlags |= MOVEFILE_REPLACE_EXISTING;
+
+			// A read-only destination refuses the replace; clear only that bit.
+			const DWORD attributes = GetFileAttributesW(destinationPath.c_str());
+			if (attributes != INVALID_FILE_ATTRIBUTES && (attributes & FILE_ATTRIBUTE_READONLY) != 0)
 			{
-				copyOptions = std::filesystem::copy_options::none;
+				SetFileAttributesW(destinationPath.c_str(), attributes & ~FILE_ATTRIBUTE_READONLY);
 			}
-			else if (removeError)
+		}
+
+		if (!MoveFileExW(temporaryPath.c_str(), destinationPath.c_str(), moveFlags))
+		{
+			const DWORD moveError = GetLastError();
+			DeleteFileW(temporaryPath.c_str());
+			if (!overwriteExisting && (moveError == ERROR_ALREADY_EXISTS || moveError == ERROR_FILE_EXISTS))
 			{
-				error = removeError;
+				return PushPathRejectionFalse(L, "bzfile Error: destination already exists");
 			}
-		}
-
-		bool copied = std::filesystem::copy_file(sourcePath, destinationPath, copyOptions, error);
-		lua_pushboolean(L, copied);
-		if (!copied)
-			{
-			auto errorMessage = error ? error.message() : "copy failed";
-			lua_pushstring(L, errorMessage.c_str());
-			return 2;
-		}
-
-		return 1;
-	}
-
-	static int ReplaceFileOnExit(lua_State* L)
-	{
-		const char* requestedSource = luaL_checkstring(L, 1);
-		const char* requestedDestination = luaL_checkstring(L, 2);
-
-		std::filesystem::path sourcePath;
-		std::filesystem::path destinationPath;
-		std::string pathError;
-		if (!TryResolveAllowedPath(requestedSource, sourcePath, pathError)
-			|| !TryResolveAllowedPath(requestedDestination, destinationPath, pathError))
-		{
-			return PushPathRejectionFalse(L, pathError);
-		}
-
-		if (IsWriteProtected(destinationPath))
-		{
-			lua_pushboolean(L, 0);
-			lua_pushfstring(L, "bzfile Error: destination is write-protected: \"%s\"", destinationPath.string().c_str());
-			return 2;
-		}
-
-		auto stagedPath = destinationPath;
-		stagedPath += ".pending";
-
-		std::error_code error;
-		std::filesystem::copy_file(
-			sourcePath,
-			stagedPath,
-			std::filesystem::copy_options::overwrite_existing,
-			error);
-		if (error)
-		{
-			lua_pushboolean(L, 0);
-			lua_pushstring(L, error.message().c_str());
-			return 2;
-		}
-
-		const DWORD currentProcessId = GetCurrentProcessId();
-		auto modulePath = GetCurrentModulePath();
-		if (modulePath.empty())
-		{
-			std::filesystem::remove(stagedPath, error);
-			lua_pushboolean(L, 0);
-			lua_pushstring(L, "could not resolve bzfile module path");
-			return 2;
-		}
-
-		auto helperPath = modulePath.parent_path() / L"bzfile_replace_helper.exe";
-
-		error.clear();
-		if (!std::filesystem::exists(helperPath, error))
-		{
-			std::filesystem::remove(stagedPath, error);
-			auto message = "helper executable not found: " + helperPath.string();
-			lua_pushboolean(L, 0);
-			lua_pushstring(L, message.c_str());
-			return 2;
-		}
-
-		auto logStem = destinationPath.stem().wstring();
-		if (logStem.empty())
-		{
-			logStem = destinationPath.filename().wstring();
-		}
-		if (logStem.empty())
-		{
-			logStem = L"bzfile";
-		}
-
-		auto logPath = GetLogsDirectoryPath() / (logStem + L"_replace.log");
-		std::vector<std::wstring> arguments = {
-			std::to_wstring(currentProcessId),
-			stagedPath.wstring(),
-			destinationPath.wstring(),
-			logPath.wstring()
-		};
-
-		std::string launchError;
-		if (!LaunchHiddenProcess(helperPath.wstring(), arguments, launchError))
-		{
-			std::filesystem::remove(stagedPath, error);
-			lua_pushboolean(L, 0);
-			lua_pushstring(L, launchError.c_str());
-			return 2;
+			return PushPathRejectionFalse(L, "bzfile Error: copy failed: " + NarrowSystemError(moveError));
 		}
 
 		lua_pushboolean(L, 1);
 		return 1;
+	}
+
+	// Retired. It let a script pick any destination under the game or
+	// Workshop roots and have the helper overwrite it once the game exited,
+	// with no hash, backup or lock: the arbitrary-destination shape AGENTS.md
+	// rules out. Nothing called it. OpenShim updates go through
+	// StageOpenShimUpdate / StageOpenShimSuiteUpdate. The export stays so a
+	// probing script gets a clear failure instead of calling nil.
+	static int ReplaceFileOnExit(lua_State* L)
+	{
+		lua_pushboolean(L, 0);
+		lua_pushstring(L,
+			"bzfile Error: ReplaceFileOnExit has been removed; "
+			"use StageOpenShimUpdate or StageOpenShimSuiteUpdate");
+		return 2;
 	}
 
 	namespace
@@ -993,10 +1093,6 @@ namespace File
 		return true;
 	}
 
-	bool SamePath(const std::filesystem::path& left, const std::filesystem::path& right)
-	{
-		return ToLower(NormalizePath(left).wstring()) == ToLower(NormalizePath(right).wstring());
-	}
 	}
 
 	static int GetFileHash(lua_State* L)
@@ -1021,7 +1117,7 @@ namespace File
 		if (!ComputeSha256(filePath, hashValue, errorMessage))
 		{
 			lua_pushnil(L);
-			lua_pushfstring(L, "bzfile Error: %s: \"%s\"", errorMessage.c_str(), filePath.string().c_str());
+			lua_pushfstring(L, "bzfile Error: %s: \"%s\"", errorMessage.c_str(), DisplayPath(filePath).c_str());
 			return 2;
 		}
 
@@ -1198,7 +1294,7 @@ namespace File
 
 		lua_pushboolean(L, 1);
 		lua_pushstring(L, "staged");
-		lua_pushstring(L, logPath.string().c_str());
+		lua_pushstring(L, DisplayPath(logPath).c_str());
 		return 3;
 	}
 
@@ -1212,6 +1308,21 @@ namespace File
 			std::filesystem::path destination;
 			std::filesystem::path staged;
 			std::filesystem::path backup;
+		};
+
+		// Every Lua argument is read before any destructible object exists: a
+		// luaL_checkstring type error longjmps and would skip the destructors
+		// of the module paths below. For the same reason all three staged
+		// paths are resolved before the payload vector is built.
+		const char* requestedStaged[3] = {
+			luaL_checkstring(L, 1),
+			luaL_checkstring(L, 3),
+			luaL_checkstring(L, 5)
+		};
+		const char* requestedHashes[3] = {
+			luaL_checkstring(L, 2),
+			luaL_checkstring(L, 4),
+			luaL_checkstring(L, 6)
 		};
 
 		const std::filesystem::path modulePath = GetCurrentModulePath();
@@ -1229,21 +1340,6 @@ namespace File
 			lua_pushstring(L, "OpenShim suite staging is restricted to Workshop item 3686673790");
 			return 2;
 		}
-
-		// Resolve all three staged paths before building the payload vector. The
-		// old initializer-list form called CheckPathAllowed mid-construction, so
-		// a rejection on the second or third path longjmp'd out with the earlier
-		// payload entries already built and never destroyed.
-		const char* requestedStaged[3] = {
-			luaL_checkstring(L, 1),
-			luaL_checkstring(L, 3),
-			luaL_checkstring(L, 5)
-		};
-		const char* requestedHashes[3] = {
-			luaL_checkstring(L, 2),
-			luaL_checkstring(L, 4),
-			luaL_checkstring(L, 6)
-		};
 
 		std::filesystem::path stagedPaths[3];
 		std::string pathError;
@@ -1304,7 +1400,7 @@ namespace File
 				lua_pushboolean(L, 0);
 				lua_pushfstring(L, "suite payload %d must be %s beside the loaded bzfile.dll",
 					static_cast<int>(index + 1),
-					payload.source.filename().string().c_str());
+					ToAnsi(payload.expectedName, nullptr).c_str());
 				return 2;
 			}
 
@@ -1401,7 +1497,7 @@ namespace File
 
 		lua_pushboolean(L, 1);
 		lua_pushstring(L, "staged");
-		lua_pushstring(L, logPath.string().c_str());
+		lua_pushstring(L, DisplayPath(logPath).c_str());
 		return 3;
 	}
 
@@ -1427,13 +1523,13 @@ namespace File
 			return PushPathRejectionFalse(
 				L,
 				"bzfile Error: refusing to delete a game/workshop root or a directory containing one: \""
-					+ path.string() + "\"");
+					+ DisplayPath(path) + "\"");
 		}
 
 		if (IsWriteProtected(path))
 		{
 			return PushPathRejectionFalse(
-				L, "bzfile Error: path is write-protected: \"" + path.string() + "\"");
+				L, "bzfile Error: path is write-protected: \"" + DisplayPath(path) + "\"");
 		}
 
 		std::error_code error;
@@ -1449,10 +1545,21 @@ namespace File
 				{
 					return PushPathRejectionFalse(
 						L,
-						"bzfile Error: refusing to recursively delete \"" + path.string()
+						"bzfile Error: refusing to recursively delete \"" + DisplayPath(path)
 							+ "\" because it contains the write-protected file \""
-							+ scan->path().filename().string() + "\"");
+							+ DisplayPath(scan->path().filename()) + "\"");
 				}
+			}
+
+			// The scan is what keeps protected files out of the recursive
+			// delete, so a scan that could not finish refuses. It used to stop
+			// at the first error and let remove_all go ahead.
+			if (scanError)
+			{
+				return PushPathRejectionFalse(
+					L,
+					"bzfile Error: could not check \"" + DisplayPath(path)
+						+ "\" for write-protected files; nothing was deleted: " + scanError.message());
 			}
 		}
 		error.clear();
@@ -1482,15 +1589,19 @@ namespace File
 		if (!std::filesystem::is_directory(path, error))
 		{
 			lua_pushnil(L);
-			lua_pushfstring(L, "bzfile Error: not a directory or does not exist: \"%s\"", path.string().c_str());
+			lua_pushfstring(L, "bzfile Error: not a directory or does not exist: \"%s\"", DisplayPath(path).c_str());
 			return 2;
 		}
 
+		// The error_code increment: the range-for form throws
+		// filesystem_error when advancing fails.
 		lua_newtable(L);
 		int index = 1;
-		for (const auto& entry : std::filesystem::directory_iterator(path, error))
+		std::filesystem::directory_iterator entry(path, error);
+		const std::filesystem::directory_iterator entryEnd;
+		for (; !error && entry != entryEnd; entry.increment(error))
 		{
-			lua_pushstring(L, entry.path().filename().string().c_str());
+			lua_pushstring(L, DisplayPath(entry->path().filename()).c_str());
 			lua_rawseti(L, -2, index++);
 		}
 
@@ -1505,15 +1616,20 @@ namespace File
 		return 1;
 	}
 
+	// Write protection can no longer be switched off from Lua. The old flag
+	// disabled it process-wide, for bzfile.dll itself and for Delete's scan,
+	// and nothing used it. Both exports stay so a probing script gets a clear
+	// answer instead of calling nil.
 	static int SetAllowWinmmOverwrite(lua_State* L)
 	{
-		g_AllowWinmmOverwrite = lua_toboolean(L, 1) != 0;
-		return 0;
+		lua_pushboolean(L, 0);
+		lua_pushstring(L, "bzfile Error: write protection cannot be disabled");
+		return 2;
 	}
 
 	static int GetAllowWinmmOverwrite(lua_State* L)
 	{
-		lua_pushboolean(L, g_AllowWinmmOverwrite);
+		lua_pushboolean(L, 0);
 		return 1;
 	}
 }
@@ -1526,32 +1642,32 @@ static int lua_Init(lua_State* L)
 	lua_pushvalue(L, fileMethodTable); // the next function will pop this but we still want the table on the stack
 	lua_setglobal(L, "_bzfile_impl_file_table");
 
-	lua_pushcfunction(L, &File::Write);
+	lua_pushcfunction(L, &File::Guarded<&File::Write>);
 	lua_setfield(L, -2, "Write");
 
-	lua_pushcfunction(L, &File::Writeln);
+	lua_pushcfunction(L, &File::Guarded<&File::Writeln>);
 	lua_setfield(L, -2, "Writeln");
 
-	lua_pushcfunction(L, &File::Read);
+	lua_pushcfunction(L, &File::Guarded<&File::Read>);
 	lua_setfield(L, -2, "Read");
 
-	lua_pushcfunction(L, &File::Readln);
+	lua_pushcfunction(L, &File::Guarded<&File::Readln>);
 	lua_setfield(L, -2, "Readln");
 
-	lua_pushcfunction(L, &File::Dump);
+	lua_pushcfunction(L, &File::Guarded<&File::Dump>);
 	lua_setfield(L, -2, "Dump");
 
-	lua_pushcfunction(L, &File::Flush);
+	lua_pushcfunction(L, &File::Guarded<&File::Flush>);
 	lua_setfield(L, -2, "Flush");
 
-	lua_pushcfunction(L, &File::Close);
+	lua_pushcfunction(L, &File::Guarded<&File::Close>);
 	lua_setfield(L, -2, "Close");
 
 	// File Metatables
 
 	luaL_newmetatable(L, "FileMetatable");
 	lua_pushstring(L, "__gc");
-	lua_pushcfunction(L, &File::Cleanup);
+	lua_pushcfunction(L, &File::Guarded<&File::Cleanup>);
 	lua_settable(L, -3);
 
 	lua_pushstring(L, "__index");
@@ -1563,22 +1679,23 @@ static int lua_Init(lua_State* L)
 
 extern "C" int __declspec(dllexport) luaopen_bzfile(lua_State* L)
 {
+	// Every binding runs behind File::Guarded, the C++ exception barrier.
 	static constexpr luaL_Reg EXPORT[] = {
-		{ "Open", &File::Open },
-		{ "GetWorkingDirectory", &File::GetWorkingDirectory },
-		{ "GetWorkshopDirectory", &File::GetWorkshopDirectory },
-		{ "MakeDirectory", &File::MakeDirectory },
-		{ "Exists", &File::Exists },
-		{ "CopyFile", &File::CopyFile },
-		{ "ReplaceFileOnExit", &File::ReplaceFileOnExit },
-		{ "GetFileHash", &File::GetFileHash },
-		{ "GetFileVersion", &File::GetFileVersion },
-		{ "StageOpenShimUpdate", &File::StageOpenShimUpdate },
-		{ "StageOpenShimSuiteUpdate", &File::StageOpenShimSuiteUpdate },
-		{ "Delete", &File::Delete },
-		{ "ListDirectory", &File::ListDirectory },
-		{ "SetAllowWinmmOverwrite", &File::SetAllowWinmmOverwrite },
-		{ "GetAllowWinmmOverwrite", &File::GetAllowWinmmOverwrite },
+		{ "Open", &File::Guarded<&File::Open> },
+		{ "GetWorkingDirectory", &File::Guarded<&File::GetWorkingDirectory> },
+		{ "GetWorkshopDirectory", &File::Guarded<&File::GetWorkshopDirectory> },
+		{ "MakeDirectory", &File::Guarded<&File::MakeDirectory> },
+		{ "Exists", &File::Guarded<&File::Exists> },
+		{ "CopyFile", &File::Guarded<&File::CopyFile> },
+		{ "ReplaceFileOnExit", &File::Guarded<&File::ReplaceFileOnExit> },
+		{ "GetFileHash", &File::Guarded<&File::GetFileHash> },
+		{ "GetFileVersion", &File::Guarded<&File::GetFileVersion> },
+		{ "StageOpenShimUpdate", &File::Guarded<&File::StageOpenShimUpdate> },
+		{ "StageOpenShimSuiteUpdate", &File::Guarded<&File::StageOpenShimSuiteUpdate> },
+		{ "Delete", &File::Guarded<&File::Delete> },
+		{ "ListDirectory", &File::Guarded<&File::ListDirectory> },
+		{ "SetAllowWinmmOverwrite", &File::Guarded<&File::SetAllowWinmmOverwrite> },
+		{ "GetAllowWinmmOverwrite", &File::Guarded<&File::GetAllowWinmmOverwrite> },
 		{0, 0}
 	};
 
