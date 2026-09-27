@@ -14,7 +14,7 @@ This is an audit-only pass: no source was changed, and every item below is backl
 
 - Every tracked source, script, workflow and project file was read end to end. That is about 3,500 lines of first-party code and scripts, plus the vendored Lua headers and the members of the prebuilt `lib/Lua5.1-BZR*.lib`.
 - Consumers were read to judge real exposure:
-  - Campaign Reimagined `Scripts/OpenShimInstaller.lua`, `AutoSave.lua`, `CareerStats.lua`, `LogPaths.lua`, `PersistentConfig.lua` and `RequireFix.lua`. These came from the `Documents\GIT\Campaign-Reimagined` checkout; see section 7.
+  - Campaign Reimagined `Scripts/OpenShimInstaller.lua`, `AutoSave.lua`, `CareerStats.lua`, `LogPaths.lua`, `PersistentConfig.lua` and `RequireFix.lua`. These came from CR's canonical `Documents\GIT\Campaign-Reimagined` checkout.
   - OpenShim `src/patches/openshim_updater.cpp`.
 - Reproductions ran against scratch files only, never a game install:
   - The prebuilt `Release\bzfile_replace_helper.exe` was run twice (worksheet B, exp1 and exp2):
