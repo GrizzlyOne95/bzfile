@@ -37,6 +37,20 @@ make_game_dir() {
     : >"$dir/battlezone98redux.exe"
 }
 
+# Stand-ins for the release binaries, carrying the same identifying text in the
+# same encoding: the DLL's "bzfile Error:" messages are ASCII, the helper's log
+# text is a UTF-16LE literal.
+make_stub_binaries() {
+    local dir="$1" text="bzfile replace helper started." i
+    printf 'MZ bzfile Error: stub\n' >"$dir/bzfile.dll"
+    {
+        printf 'MZ'
+        for ((i = 0; i < ${#text}; i++)); do
+            printf '%s\0' "${text:i:1}"
+        done
+    } >"$dir/bzfile_replace_helper.exe"
+}
+
 write_libraryfolders() {
     local vdf="$1" library_root="$2"
     mkdir -p "$(dirname "$vdf")"
@@ -76,6 +90,27 @@ test_version_header() {
     grep -Eq '#define[[:space:]]+BZFILE_VERSION_STRING[[:space:]]+"[0-9]+\.[0-9]+\.[0-9]+"' "$header" \
         || fail "BZFILE_VERSION_STRING missing or malformed in include/bzfile_version.h"
     pass "version header parses"
+}
+
+# The write-protection rule shared by every mutating bzfile binding is pure
+# C++, so it is tested here even though the DLL itself only builds with MSVC.
+test_write_policy() {
+    local cxx="${CXX:-}" candidate
+    if [[ -z "$cxx" ]]; then
+        for candidate in g++ clang++; do
+            if command -v "$candidate" >/dev/null 2>&1; then
+                cxx="$candidate"
+                break
+            fi
+        done
+    fi
+    [[ -n "$cxx" ]] || fail "no C++ compiler for tests/host/write_policy_tests.cpp"
+
+    "$cxx" -std=c++17 -Wall -Wextra -Werror \
+        -o "$TMP_ROOT/write_policy_tests" "$ROOT/tests/host/write_policy_tests.cpp" \
+        || fail "tests/host/write_policy_tests.cpp did not compile"
+    "$TMP_ROOT/write_policy_tests" || fail "write policy checks failed"
+    pass "write policy"
 }
 
 test_script_syntax() {
@@ -199,8 +234,7 @@ test_flavour_filter_uses_discovering_root() {
         || fail "--snap on an external native library printed: $out"
 
     artifacts="$(workdir artifacts)"
-    printf 'bzfile Error: stub\n' >"$artifacts/bzfile.dll"
-    printf 'bzfile replace helper stub\n' >"$artifacts/bzfile_replace_helper.exe"
+    make_stub_binaries "$artifacts"
 
     status=0
     out="$(run_installer "$home" --native --dll "$artifacts/bzfile.dll")" || status=$?
@@ -212,7 +246,37 @@ test_flavour_filter_uses_discovering_root() {
     pass "flavour filter follows the discovering Steam root"
 }
 
+# Installing again over our own files is the upgrade path. The helper's
+# identity check used to look for ASCII text the real (UTF-16) helper does not
+# contain, so every second install refused to replace it.
+test_reinstall_over_existing() {
+    local home game artifacts out status run
+
+    home="$(workdir reinstallhome)"
+    game="$home/.local/share/Steam/steamapps/common/Battlezone 98 Redux"
+    make_game_dir "$game"
+    artifacts="$(workdir reinstallartifacts)"
+    make_stub_binaries "$artifacts"
+
+    for run in first second; do
+        status=0
+        out="$(run_installer "$home" --native --dll "$artifacts/bzfile.dll")" || status=$?
+        [[ $status -eq 0 ]] || fail "$run install exited $status: $out"
+    done
+    cmp -s "$artifacts/bzfile_replace_helper.exe" "$game/bzfile_replace_helper.exe" \
+        || fail "re-install did not refresh the helper"
+
+    # A foreign file under the helper's name must still be refused.
+    printf 'not ours\n' >"$game/bzfile_replace_helper.exe"
+    status=0
+    out="$(run_installer "$home" --native --dll "$artifacts/bzfile.dll")" || status=$?
+    [[ $status -ne 0 ]] || fail "installer overwrote a foreign bzfile_replace_helper.exe"
+
+    pass "re-install replaces our own helper and refuses a foreign one"
+}
+
 test_version_header
+test_write_policy
 test_script_syntax
 test_steam_path_override
 test_help_exits_clean
@@ -220,5 +284,6 @@ test_no_install_is_empty
 test_symlink_aliases_dedupe
 test_external_library_flavours
 test_flavour_filter_uses_discovering_root
+test_reinstall_over_existing
 
 echo "All Linux host checks passed."
