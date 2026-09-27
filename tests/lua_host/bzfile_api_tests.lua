@@ -119,6 +119,32 @@ end
 
 check(bzfile.IsOpenShimUpdateActive() == false, "no update helper is active")
 
+do
+    local handle = assert(bzfile.Open(path("crlf.txt"), "rb"))
+    check(handle:Read(0) == "", "Read(0) returns an empty string")
+    check(not pcall(handle.Read, handle, -1), "Read with a negative count raises an argument error")
+    check(handle:Read(1) == "l", "Read(1) still reads one byte")
+    handle:Close()
+end
+
+writeRaw("nul.txt", "before\0after\nsecond\n")
+do
+    local handle = assert(bzfile.Open(path("nul.txt"), "rb"))
+    check(handle:Readln() == "before\0after", "Readln keeps embedded NUL bytes")
+    handle:Close()
+end
+
+check(_bzfile_impl_file_table == nil, "no internal global is published")
+check(debug.getregistry()["bzfile.File"] ~= nil, "file handles use the namespaced metatable")
+
+-- Relative paths resolve from the game root, not the working directory.
+do
+    local handle = assert(bzfile.Open("relative.txt", "w", "trunc"))
+    handle:Write("relative")
+    handle:Close()
+    check(readRaw("relative.txt") == "relative", "a relative path lands in the game root")
+end
+
 -- Roots -------------------------------------------------------------------
 
 check(bzfile.GetWorkshopDirectory() == "", "no Workshop root outside a Steam library")
