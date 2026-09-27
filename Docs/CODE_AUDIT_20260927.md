@@ -155,7 +155,8 @@ Worksheet A section 3 has the full list, with the greps used.
   - Its check of the update mutex before staging is the pattern for P0-7.
   - Its P0-8 (helper launched unverified) is the other half of P1-4.
 - **EXU:** P1-1 should share EXU G-1's `dummynode` gate and, ideally, one Lua core build.
-- **AGENTS.md:** it names `%USERPROFILE%\Documents\Google Drive\Ian Files\Battlezone Files\Redux Maps\Open Patch - CampaignReimagined` as CR's only editable source.
-  - On this machine Google Drive is mounted and `Redux Maps` exists, but that folder does not (checked 2026-09-27).
-  - The CR evidence above therefore comes from the `Documents\GIT\Campaign-Reimagined` checkout.
-  - Re-check the CR items against the canonical tree once it is available.
+- **AGENTS.md (bzfile and CR):** `main` still names a Google Drive tree as
+  CR's only editable source. CR has moved to `Documents\GIT\Campaign-Reimagined`,
+  which is what this audit read; the correction is commit 2ae86bb on the
+  unmerged `agent/campaign-path-migration` branch, and CR's own `AGENTS.md:7`
+  needs the same update. This supersedes the AGENTS.md part of C-14.
