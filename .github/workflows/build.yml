@@ -62,6 +62,12 @@ jobs:
             if ($versionInfo.ProductVersion -ne $expectedFileVersion) {
               throw "PE ProductVersion mismatch for '$path': expected '$expectedFileVersion', got '$($versionInfo.ProductVersion)'."
             }
+            # The numeric FILEVERSION tuple is a separate field from the
+            # strings above, and it is what bzfile.GetFileVersion reports.
+            $numericVersion = "{0}.{1}.{2}.{3}" -f $versionInfo.FileMajorPart, $versionInfo.FileMinorPart, $versionInfo.FileBuildPart, $versionInfo.FilePrivatePart
+            if ($numericVersion -ne $expectedFileVersion) {
+              throw "PE numeric FILEVERSION mismatch for '$path': expected '$expectedFileVersion', got '$numericVersion'."
+            }
           }
 
       - name: Test deferred replacement transactions
