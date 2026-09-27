@@ -2,6 +2,11 @@
 // by real Lua outside Battlezone 98 Redux.
 //
 //   bzfile_lua_host.exe <script.lua>
+//   bzfile_lua_host.exe --expect-unsupported-build
+//
+// The second form checks bzfile's game-build gate: it makes the shared
+// dummynode look non-empty just for the luaopen_bzfile call and expects
+// bzfile to refuse to load.
 //
 // Like the game, this process runs its own copy of the BZR Lua core
 // (lib/Lua5.1-BZR.lib) and loads bzfile.dll, which links a second copy. Both
@@ -20,6 +25,8 @@
 #include <lua.hpp>
 
 #include <cstdio>
+#include <cstring>
+#include <cwchar>
 #include <string>
 
 namespace
@@ -36,9 +43,10 @@ int wmain(int argc, wchar_t** argv)
 {
 	if (argc != 2)
 	{
-		std::fputs("usage: bzfile_lua_host.exe <script.lua>\n", stderr);
+		std::fputs("usage: bzfile_lua_host.exe <script.lua> | --expect-unsupported-build\n", stderr);
 		return 2;
 	}
+	const bool expectUnsupportedBuild = std::wcscmp(argv[1], L"--expect-unsupported-build") == 0;
 
 	const auto spanBegin = reinterpret_cast<uintptr_t>(g_gameDataSpan);
 	const auto spanEnd = spanBegin + sizeof(g_gameDataSpan);
@@ -86,6 +94,23 @@ int wmain(int argc, wchar_t** argv)
 
 	lua_State* L = luaL_newstate();
 	luaL_openlibs(L);
+
+	if (expectUnsupportedBuild)
+	{
+		// Only bzfile's gate reads the node here; no Lua runs between the
+		// write and the restore.
+		volatile unsigned char* node = &g_gameDataSpan[kGameDummyNode - spanBegin];
+		node[4] = 0xFF;
+		lua_pushcfunction(L, openBzfile);
+		const int status = lua_pcall(L, 0, 0, 0);
+		node[4] = 0;
+
+		const char* message = status != 0 ? lua_tostring(L, -1) : nullptr;
+		const bool refused = message != nullptr && std::strstr(message, "unsupported game build") != nullptr;
+		std::printf("%s\n", refused ? message : "bzfile loaded on an unsupported build");
+		lua_close(L);
+		return refused ? 0 : 1;
+	}
 
 	lua_pushcfunction(L, openBzfile);
 	if (lua_pcall(L, 0, 0, 0) != 0)
