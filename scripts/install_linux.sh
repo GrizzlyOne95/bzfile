@@ -141,16 +141,12 @@ download_matched_release() {
     local dest="$1"
     mkdir -p "$dest"
     local zip_url
-    # Release workflow publishes bzfile-<tag>.zip; fall back to any zip asset
-    # only if that naming is absent.
-    zip_url="$(latest_asset_url "$REPO_SLUG" 'bzfile-v[^/]*\.zip')"
+    # Only the versioned zip the release workflow publishes (bzfile-v<x.y.z>.zip).
+    # The looser fallbacks this replaced could pick up any zip asset, such as
+    # the retired pre-hardening "Latest Build".
+    zip_url="$(latest_asset_url "$REPO_SLUG" 'bzfile-v[0-9][^/]*\.zip')"
     if [[ -z "$zip_url" ]]; then
-        zip_url="$(latest_asset_url "$REPO_SLUG" 'bzfile-[^/]*\.zip')"
-    fi
-    if [[ -z "$zip_url" ]]; then
-        zip_url="$(latest_asset_url "$REPO_SLUG" '\.zip')"
-    fi
-    if [[ -z "$zip_url" ]]; then
+        echo "error: the latest $REPO_SLUG release has no bzfile-v*.zip asset." >&2
         return 1
     fi
     echo "Downloading matched release zip from $REPO_SLUG ..."
@@ -160,7 +156,19 @@ download_matched_release() {
         return 1
     fi
     unzip -qo "$dest/bzfile-release.zip" -d "$dest"
-    [[ -s "$dest/bzfile.dll" && -s "$dest/bzfile_replace_helper.exe" ]]
+    [[ -s "$dest/bzfile.dll" && -s "$dest/bzfile_replace_helper.exe" ]] || return 1
+
+    # The zip carries SHA256SUMS.txt from the release build. It comes from the
+    # same place as the binaries, so it proves the files arrived intact and
+    # belong together, not who published them.
+    if [[ ! -s "$dest/SHA256SUMS.txt" ]]; then
+        echo "error: the release zip has no SHA256SUMS.txt." >&2
+        return 1
+    fi
+    if ! (cd "$dest" && sha256sum --quiet -c SHA256SUMS.txt); then
+        echo "error: the release files do not match SHA256SUMS.txt." >&2
+        return 1
+    fi
 }
 
 deploy_matched() {
