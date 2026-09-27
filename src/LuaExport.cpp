@@ -1759,8 +1759,146 @@ static int lua_Init(lua_State* L)
 	return 0;
 }
 
+namespace
+{
+	// bzfile links its own copy of the BZR Lua 5.1 core (lib/Lua5.1-BZR.lib)
+	// and runs it on the game's lua_State. The two copies agree on one shared
+	// sentinel only by address: the core is built with
+	//     #define dummynode (0x86EEF0)
+	// (ltable.c), the game's static const dummynode_. luaH_resize frees a
+	// table's node array unless it is that sentinel, so on a game build where
+	// dummynode_ moved, the first table resize frees static memory and
+	// corrupts the game's heap. Refuse to load unless the running exe really
+	// has an empty Node at that address that its own code refers to.
+	//
+	// On GOG and Steam 2.2.301 it sits in .rdata, all 32 bytes zero, with 7
+	// imm32 references in .text. The Steam exe's .text is SteamStub-encrypted
+	// on disk, which is why this runs in-process: by now it is decrypted.
+	constexpr uintptr_t kSharedLuaDummyNode = 0x0086EEF0;
+	constexpr size_t kLuaNodeSize = 32;
+
+	enum class DummyNodeCheck
+	{
+		Ok,
+		NotInImage,
+		InExecutableSection,
+		NotEmpty,
+		NotReferenced,
+		Fault
+	};
+
+	// POD only, so the SEH frame is legal; a malformed or unreadable image
+	// reports Fault instead of crashing the game.
+	DummyNodeCheck CheckHostLuaDummyNode()
+	{
+		__try
+		{
+			const auto base = reinterpret_cast<const BYTE*>(GetModuleHandleW(nullptr));
+			const auto dos = reinterpret_cast<const IMAGE_DOS_HEADER*>(base);
+			if (dos->e_magic != IMAGE_DOS_SIGNATURE)
+			{
+				return DummyNodeCheck::Fault;
+			}
+			const auto nt = reinterpret_cast<const IMAGE_NT_HEADERS32*>(base + dos->e_lfanew);
+			if (nt->Signature != IMAGE_NT_SIGNATURE)
+			{
+				return DummyNodeCheck::Fault;
+			}
+
+			const uintptr_t imageBase = reinterpret_cast<uintptr_t>(base);
+			if (kSharedLuaDummyNode < imageBase)
+			{
+				return DummyNodeCheck::NotInImage;
+			}
+			const uintptr_t nodeRva = kSharedLuaDummyNode - imageBase;
+
+			const IMAGE_SECTION_HEADER* sections = IMAGE_FIRST_SECTION(nt);
+			const WORD sectionCount = nt->FileHeader.NumberOfSections;
+			bool nodeInData = false;
+			for (WORD index = 0; index < sectionCount; ++index)
+			{
+				const IMAGE_SECTION_HEADER& section = sections[index];
+				const uintptr_t begin = section.VirtualAddress;
+				const uintptr_t end = begin + section.Misc.VirtualSize;
+				if (nodeRva >= begin && nodeRva + kLuaNodeSize <= end)
+				{
+					if ((section.Characteristics & IMAGE_SCN_MEM_EXECUTE) != 0)
+					{
+						return DummyNodeCheck::InExecutableSection;
+					}
+					nodeInData = true;
+				}
+			}
+			if (!nodeInData)
+			{
+				return DummyNodeCheck::NotInImage;
+			}
+
+			// An empty Node is all zero bytes: nil key, nil value, no next.
+			const BYTE* node = reinterpret_cast<const BYTE*>(kSharedLuaDummyNode);
+			for (size_t offset = 0; offset < kLuaNodeSize; ++offset)
+			{
+				if (node[offset] != 0)
+				{
+					return DummyNodeCheck::NotEmpty;
+				}
+			}
+
+			const DWORD needle = static_cast<DWORD>(kSharedLuaDummyNode);
+			for (WORD index = 0; index < sectionCount; ++index)
+			{
+				const IMAGE_SECTION_HEADER& section = sections[index];
+				if ((section.Characteristics & IMAGE_SCN_MEM_EXECUTE) == 0
+					|| section.Misc.VirtualSize < sizeof(DWORD))
+				{
+					continue;
+				}
+
+				const BYTE* bytes = base + section.VirtualAddress;
+				const size_t last = section.Misc.VirtualSize - sizeof(DWORD);
+				for (size_t offset = 0; offset <= last; ++offset)
+				{
+					if (bytes[offset] == static_cast<BYTE>(needle)
+						&& memcmp(bytes + offset, &needle, sizeof(needle)) == 0)
+					{
+						return DummyNodeCheck::Ok;
+					}
+				}
+			}
+			return DummyNodeCheck::NotReferenced;
+		}
+		__except (EXCEPTION_EXECUTE_HANDLER)
+		{
+			return DummyNodeCheck::Fault;
+		}
+	}
+
+	const char* DescribeDummyNodeCheck(DummyNodeCheck result)
+	{
+		switch (result)
+		{
+		case DummyNodeCheck::NotInImage: return "it is outside the game executable";
+		case DummyNodeCheck::InExecutableSection: return "it falls in code, not data";
+		case DummyNodeCheck::NotEmpty: return "the memory there is not an empty Lua node";
+		case DummyNodeCheck::NotReferenced: return "the game's code never refers to it";
+		case DummyNodeCheck::Fault: return "the game executable could not be inspected";
+		default: return "unknown";
+		}
+	}
+}
+
 extern "C" int __declspec(dllexport) luaopen_bzfile(lua_State* L)
 {
+	const DummyNodeCheck hostCheck = CheckHostLuaDummyNode();
+	if (hostCheck != DummyNodeCheck::Ok)
+	{
+		return luaL_error(L,
+			"bzfile: unsupported game build; its Lua core does not keep the shared dummynode at 0x%p (%s). "
+			"Loading would corrupt the game's Lua heap.",
+			reinterpret_cast<void*>(kSharedLuaDummyNode),
+			DescribeDummyNodeCheck(hostCheck));
+	}
+
 	// Every binding runs behind File::Guarded, the C++ exception barrier.
 	static constexpr luaL_Reg EXPORT[] = {
 		{ "Open", &File::Guarded<&File::Open> },

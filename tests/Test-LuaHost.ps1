@@ -38,6 +38,21 @@ try {
         throw "bzfile Lua API tests failed (exit $exitCode)."
     }
     Write-Host "bzfile Lua API tests passed."
+
+    # bzfile must refuse to load when the game's Lua dummynode is not where
+    # its Lua core expects it.
+    Push-Location $scratch
+    try {
+        & (Join-Path $scratch "bzfile_lua_host.exe") --expect-unsupported-build
+        $exitCode = $LASTEXITCODE
+    }
+    finally {
+        Pop-Location
+    }
+    if ($exitCode -ne 0) {
+        throw "bzfile loaded on a game build whose Lua dummynode does not match (exit $exitCode)."
+    }
+    Write-Host "bzfile refuses an unsupported game build."
 }
 finally {
     Remove-Item -LiteralPath $scratch -Recurse -Force -ErrorAction SilentlyContinue
