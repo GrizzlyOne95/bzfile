@@ -85,11 +85,34 @@ run_installer() {
     return $status
 }
 
+# bzfile_version.h spells one version several ways: the four numbers, the
+# resource tuple (what GetFileVersion and Explorer report), the release string
+# and the resource string. CI only compares the resource string with the tag,
+# so every spelling must agree with the four numbers.
 test_version_header() {
     local header="$ROOT/include/bzfile_version.h"
-    grep -Eq '#define[[:space:]]+BZFILE_VERSION_STRING[[:space:]]+"[0-9]+\.[0-9]+\.[0-9]+"' "$header" \
-        || fail "BZFILE_VERSION_STRING missing or malformed in include/bzfile_version.h"
-    pass "version header parses"
+    macro() {
+        sed -n -E "s/^#define[[:space:]]+BZFILE_VERSION_$1[[:space:]]+(.*[^[:space:]])[[:space:]]*\$/\1/p" "$header" \
+            | tr -d '\r'
+    }
+    local major minor patch build
+    major="$(macro MAJOR)"
+    minor="$(macro MINOR)"
+    patch="$(macro PATCH)"
+    build="$(macro BUILD)"
+    [[ "$major$minor$patch$build" =~ ^[0-9]+$ ]] \
+        || fail "BZFILE_VERSION_MAJOR/MINOR/PATCH/BUILD missing or not numeric"
+
+    local expected_tuple="$major,$minor,$patch,$build"
+    local expected_string="\"$major.$minor.$patch\""
+    local expected_file_string="\"$major.$minor.$patch.$build\\0\""
+    [[ "$(macro TUPLE)" == "$expected_tuple" ]] \
+        || fail "BZFILE_VERSION_TUPLE is '$(macro TUPLE)', expected '$expected_tuple'"
+    [[ "$(macro STRING)" == "$expected_string" ]] \
+        || fail "BZFILE_VERSION_STRING is $(macro STRING), expected $expected_string"
+    [[ "$(macro FILE_STRING)" == "$expected_file_string" ]] \
+        || fail "BZFILE_VERSION_FILE_STRING is $(macro FILE_STRING), expected $expected_file_string"
+    pass "version header spellings agree ($major.$minor.$patch.$build)"
 }
 
 # The write-protection rule shared by every mutating bzfile binding is pure
