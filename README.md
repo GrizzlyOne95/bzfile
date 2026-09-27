@@ -23,6 +23,17 @@ curl -fsSL https://raw.githubusercontent.com/GrizzlyOne95/bzfile/main/scripts/in
 
 No Steam launch options are required. Proton loads `bzfile.dll` as a Windows DLL (this is not an OpenShim `winmm.dll` proxy).
 
+GOG under Wine (or any install the scripts do not find), point at the game
+folder, which must contain `battlezone98redux.exe`:
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/GrizzlyOne95/bzfile/main/scripts/install_linux.sh | bash -s -- --game-path "$HOME/.wine/drive_c/GOG Games/Battlezone 98 Redux"
+```
+
+Re-running the installer upgrades in place and keeps the three most recent
+backups. To remove bzfile again (only files that identify as bzfile's own),
+add `--uninstall` to the same command.
+
 To copy a local Windows build instead of a GitHub release:
 
 ```bash
