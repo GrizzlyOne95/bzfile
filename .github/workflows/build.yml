@@ -68,6 +68,13 @@ jobs:
         shell: pwsh
         run: .\tests\Test-ReplaceHelper.ps1 -HelperPath .\Release\bzfile_replace_helper.exe
 
+      - name: Build test Lua host
+        run: msbuild tests\lua_host\bzfile_lua_host.vcxproj /p:Configuration=Release /p:Platform=Win32
+
+      - name: Test Lua API through a real Lua host
+        shell: pwsh
+        run: .\tests\Test-LuaHost.ps1 -HostPath .\tests\lua_host\bin\bzfile_lua_host.exe -DllPath .\Release\bzfile.dll
+
       - name: Upload verified binaries
         uses: actions/upload-artifact@v4
         with:
