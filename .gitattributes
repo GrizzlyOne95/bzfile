@@ -64,3 +64,8 @@
 
 include/** linguist-vendored
 
+###############################################################################
+# Shell scripts run under Linux bash (Proton installers, host checks); CRLF
+# breaks them there, so check them out with LF on every platform.
+###############################################################################
+*.sh text eol=lf
