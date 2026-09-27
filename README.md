@@ -94,6 +94,11 @@ Valid options for write parameters are:
 - "trunc": truncate file (clears the file before writing)
 
 Default options if only path is specified is "r" (read). In "w" (write) mode the default option is "app" (append).
+Add "b" to the mode ("rb", "wb") for binary I/O; text mode translates CRLF line endings.
+
+On failure `Open` returns `nil, errorMessage` instead of a handle, for example
+when the path is outside the allowed roots or write-protected (see
+[Write protection](#write-protection)).
 
 ### File Methods:
 
@@ -110,7 +115,8 @@ Write with newline.
 ```lua
 file:Read(count: int?) -> content: string
 ```
-Unformatted read of count characters, defaults to 1 if not specified.
+Unformatted read of up to count characters, defaults to 1 if not specified.
+Returns `nil` at end of file. A count above 64 MiB raises an argument error.
 
 ```lua
 file:Readln() -> content: string
@@ -120,7 +126,9 @@ Reads a line.
 ```lua
 file:Dump() -> content: string
 ```
-Dumps the entire contents of the file into one string.
+Dumps the entire contents of the file into one string. On a text-mode handle
+line endings are translated, so open with "rb" to get the exact bytes. Files
+over 64 MiB return `nil, errorMessage`; a write-only handle returns `""`.
 
 ```lua
 file:Flush() -> self
@@ -142,12 +150,14 @@ Gets the root directory of the game (..\common\Battlezone98Redux\).
 ```lua
 bzfile.GetWorkshopDirectory() -> path: string
 ```
-Gets the workshop directory (..\content\301650).
+Gets the Steam Workshop content directory (`...\steamapps\workshop\content\301650`).
+Returns `""` when the game is not inside a Steam library (for example GOG); there
+is then no Workshop write root.
 
 ```lua
-bzfile.MakeDirectory(path: string) -> nil
+bzfile.MakeDirectory(path: string) -> success: boolean, errorMessage?: string
 ```
-Makes a new directory at the given path.
+Makes a new directory (and any missing parents) at the given path.
 
 ```lua
 bzfile.Exists(path: string) -> exists: boolean
@@ -157,18 +167,57 @@ Checks whether a file or directory exists.
 ```lua
 bzfile.CopyFile(sourcePath: string, destinationPath: string, overwriteExisting: boolean?) -> success: boolean, errorMessage?: string
 ```
-Copies a file as raw bytes. The destination must still be inside the game root or workshop root.
+Copies a file as raw bytes. Both paths must be inside the game root or Workshop
+root, and the destination must not be write-protected. The copy is written
+beside the destination and renamed into place, so an existing destination is
+untouched unless a complete copy exists. Without `overwriteExisting` an
+existing destination is refused. Copying a file onto itself is refused.
 
 ```lua
-bzfile.ReplaceFileOnExit(sourcePath: string, destinationPath: string) -> success: boolean, errorMessage?: string
+bzfile.Delete(path: string) -> success: boolean, errorMessage?: string
 ```
-Stages a replacement file under the allowed write roots, then launches a hidden
-helper that waits for the current game process to exit before force-copying the
-staged file onto the destination. This is useful for replacing loaded DLLs such
-as `winmm.dll` that cannot always be overwritten in-place while Battlezone is
-still running. Ship `bzfile_replace_helper.exe` beside `bzfile.dll`; the helper
-also writes a `<destination-stem>_replace.log` file next to the target when it
-runs.
+Deletes a file, or a directory recursively. Refused for the game or Workshop
+root (or a directory containing one), for write-protected files, and for a
+directory holding any write-protected file.
+
+```lua
+bzfile.ListDirectory(path: string) -> names: {string}?, errorMessage?: string
+```
+Returns the names of the entries directly inside a directory.
+
+```lua
+bzfile.ReplaceFileOnExit(sourcePath: string, destinationPath: string) -> false, errorMessage: string
+```
+Removed. It let a script choose any destination for a deferred replacement with
+no hash or backup. Use `StageOpenShimUpdate` or `StageOpenShimSuiteUpdate`.
+The function still exists and always returns `false` with an explanation.
+
+```lua
+bzfile.SetAllowWinmmOverwrite(allow: boolean) -> false, errorMessage: string
+bzfile.GetAllowWinmmOverwrite() -> false
+```
+Retained for compatibility only. Write protection can no longer be disabled.
+
+### Write protection
+
+Every function that creates, overwrites, copies onto or deletes a path refuses
+these names, anywhere in the allowed roots:
+
+- native code: any `.dll`, `.exe` or `.asi` (this covers `winmm.dll`,
+  `bzloader.dll`, `openshim.dll`, `bzfile.dll`, `bzfile_replace_helper.exe` and
+  the game executable);
+- native configuration replaced only by the verified suite update: `net.ini`,
+  `patches.json`, `openshim_net.ini.payload`, `openshim_patches.json.payload`;
+- update transaction files: any name containing `.pending`, or ending in
+  `.previous`.
+
+Names are compared the way Windows resolves them: case-insensitively, ignoring
+trailing dots and spaces and any `:stream` suffix. `openshim.ini` and the
+`*_update.status` files remain writable.
+
+Argument type errors raise as usual in Lua. Internal failures (out of memory, a
+path the system code page cannot represent, a file-system error) come back as
+`nil, errorMessage` instead of escaping into the game.
 
 ```lua
 bzfile.GetFileHash(path: string, algorithm: string?) -> hash: string, errorMessage?: string
@@ -189,7 +238,8 @@ the script cannot choose the destination: it is always `winmm.dll` in the game
 root. The source must be an x86 DLL named `winmm.dll` beside the loaded
 `bzfile.dll`, and its SHA-256 must match `expectedSha256`. The hidden helper waits
 for Battlezone to exit, backs up the previous shim, atomically promotes the
-payload, verifies the installed hash, and rolls back on verification failure.
+payload, verifies the installed hash, and rolls back on verification failure
+(removing the new file instead when there was no previous shim).
 Progress is written to `winmm_update.status` and details to
 `winmm_replace.log` in the game root.
 
@@ -209,6 +259,22 @@ before game exit, backs up all existing destinations, promotes and verifies all
 three payloads, and rolls the suite back if any promotion or verification
 fails. Progress is written to `openshim_update.status` and details to
 `openshim_update.log`.
+
+Both staging functions refuse while an update helper is already running (see
+`IsOpenShimUpdateActive`), and write `state=failed` if the helper cannot be
+launched. The helper waits for the game to exit however long that takes,
+re-checks every staged hash before promoting, installs each file by copying it
+beside the destination and renaming it into place, and on failure rolls back
+only the files it actually replaced. Status states are `staged`,
+`waiting_for_exit`, `promoting`, `complete` and `failed`.
+
+```lua
+bzfile.IsOpenShimUpdateActive() -> active: boolean
+```
+True while an update helper owns a staged OpenShim update. A status file that
+still reads `staged` or `waiting_for_exit` while this is false was left behind
+by a helper that never finished (crash, kill, power loss); the update can be
+staged again.
 
 ## Builds and releases
 
