@@ -27,6 +27,10 @@ namespace File
 		// bad_alloc straight into the engine.
 		constexpr size_t kMaxReadBytes = 64u * 1024u * 1024u;
 
+		// Registry key of the file handle metatable. Namespaced so that another
+		// module's "FileMetatable" cannot alias it and pass luaL_checkudata.
+		constexpr const char kFileMetatable[] = "bzfile.File";
+
 		std::wstring ToLower(std::wstring value)
 		{
 			for (auto& ch : value)
@@ -302,9 +306,31 @@ namespace File
 				return false;
 			}
 
-			auto normalizedPath = NormalizePath(std::filesystem::path(requestedPath));
 			const auto workingRoot = GetWorkingDirectoryPath();
 			const auto workshopRoot = GetWorkshopDirectoryPath();
+
+			// Relative paths are taken from the game root, like the sandbox
+			// itself, not from the process working directory, which the
+			// engine or any DLL can move.
+			std::filesystem::path requested(requestedPath);
+			if (requested.is_relative())
+			{
+				requested = workingRoot / requested;
+			}
+
+			// The root decision must be made on the path with links resolved.
+			// weakly_canonical only fails for something other than "does not
+			// exist" (access denied, an unsupported reparse point), and the
+			// lexical fallback NormalizePath would use then could still route
+			// through a junction out of the sandbox.
+			std::error_code canonicalError;
+			auto normalizedPath = std::filesystem::weakly_canonical(requested, canonicalError);
+			if (canonicalError)
+			{
+				outError = "bzfile Error: could not resolve path \"" + DisplayPath(requested) + "\": "
+					+ canonicalError.message();
+				return false;
+			}
 
 			if (IsPathInsideRoot(normalizedPath, workingRoot)
 				|| (!workshopRoot.empty() && IsPathInsideRoot(normalizedPath, workshopRoot)))
@@ -636,7 +662,7 @@ namespace File
 		void* buffer = lua_newuserdata(L, sizeof(std::fstream));
 		std::fstream* fs = new (buffer) std::fstream(filePath, openMode);
 
-		luaL_getmetatable(L, "FileMetatable");
+		luaL_getmetatable(L, kFileMetatable);
 		lua_setmetatable(L, -2);
 
 		if (!fs->is_open())
@@ -661,7 +687,7 @@ namespace File
 
 	static int Write(lua_State* L)
 	{
-		std::fstream* handle = (std::fstream*)luaL_checkudata(L, 1, "FileMetatable");
+		std::fstream* handle = (std::fstream*)luaL_checkudata(L, 1, kFileMetatable);
 		if (!handle->is_open()) return luaL_error(L, "bzfile Error: file is not open");
 
 		size_t len;
@@ -674,7 +700,7 @@ namespace File
 
 	static int Writeln(lua_State* L)
 	{
-		std::fstream* handle = (std::fstream*)luaL_checkudata(L, 1, "FileMetatable");
+		std::fstream* handle = (std::fstream*)luaL_checkudata(L, 1, kFileMetatable);
 		if (!handle->is_open()) return luaL_error(L, "bzfile Error: file is not open");
 
 		size_t len;
@@ -688,12 +714,14 @@ namespace File
 
 	static int Read(lua_State* L)
 	{
-		std::fstream* handle = (std::fstream*)luaL_checkudata(L, 1, "FileMetatable");
+		std::fstream* handle = (std::fstream*)luaL_checkudata(L, 1, kFileMetatable);
 		if (!handle->is_open()) return luaL_error(L, "bzfile Error: file is not open");
 
 		const lua_Integer count = luaL_optinteger(L, 2, 1);
 		luaL_argcheck(L, count <= static_cast<lua_Integer>(kMaxReadBytes), 2,
 			"count exceeds the 64 MiB read limit");
+
+		luaL_argcheck(L, count >= 0, 2, "count must not be negative");
 
 		if (handle->eof())
 		{
@@ -701,7 +729,13 @@ namespace File
 			return 1;
 		}
 
-		if (count <= 1)
+		if (count == 0)
+		{
+			lua_pushliteral(L, "");
+			return 1;
+		}
+
+		if (count == 1)
 		{
 			char c;
 			if (handle->get(c))
@@ -751,7 +785,7 @@ namespace File
 
 	static int Readln(lua_State* L)
 	{
-		std::fstream* handle = (std::fstream*)luaL_checkudata(L, 1, "FileMetatable");
+		std::fstream* handle = (std::fstream*)luaL_checkudata(L, 1, kFileMetatable);
 		if (!handle->is_open()) return luaL_error(L, "bzfile Error: file is not open");
 
 		if (handle->eof())
@@ -763,7 +797,9 @@ namespace File
 		std::string line;
 		if (std::getline(*handle, line))
 		{
-			lua_pushstring(L, line.c_str());
+			// pushlstring: a line may contain NUL bytes, which pushstring
+			// would treat as its end.
+			lua_pushlstring(L, line.data(), line.size());
 		}
 		else
 		{
@@ -774,7 +810,7 @@ namespace File
 
 	static int Dump(lua_State* L)
 	{
-		std::fstream* handle = (std::fstream*)luaL_checkudata(L, 1, "FileMetatable");
+		std::fstream* handle = (std::fstream*)luaL_checkudata(L, 1, kFileMetatable);
 		if (!handle->is_open()) return luaL_error(L, "bzfile Error: file is not open");
 
 		handle->clear();
@@ -812,7 +848,7 @@ namespace File
 
 	static int Flush(lua_State* L)
 	{
-		std::fstream* handle = (std::fstream*)luaL_checkudata(L, 1, "FileMetatable");
+		std::fstream* handle = (std::fstream*)luaL_checkudata(L, 1, kFileMetatable);
 		if (!handle->is_open()) return luaL_error(L, "bzfile Error: file is not open");
 		handle->flush();
 
@@ -823,7 +859,7 @@ namespace File
 	// This will make the file handle nil in lua
 	static int Close(lua_State* L)
 	{
-		std::fstream* handle = (std::fstream*)luaL_checkudata(L, 1, "FileMetatable");
+		std::fstream* handle = (std::fstream*)luaL_checkudata(L, 1, kFileMetatable);
 		if (handle->is_open())
 		{
 			handle->close();
@@ -1042,20 +1078,29 @@ namespace File
 		}
 
 		std::vector<char> buffer(64 * 1024);
-		while (input.good())
+		for (;;)
 		{
 			input.read(buffer.data(), static_cast<std::streamsize>(buffer.size()));
 			const auto bytesRead = input.gcount();
-			if (bytesRead <= 0)
-			{
-				break;
-			}
-
-			if (!CryptHashData(hash.handle, reinterpret_cast<const BYTE*>(buffer.data()), static_cast<DWORD>(bytesRead), 0))
+			if (bytesRead > 0
+				&& !CryptHashData(hash.handle, reinterpret_cast<const BYTE*>(buffer.data()), static_cast<DWORD>(bytesRead), 0))
 			{
 				errorMessage = "CryptHashData failed";
 				return false;
 			}
+
+			if (!input)
+			{
+				break;
+			}
+		}
+
+		// A short final read sets eofbit. A read error without it would
+		// otherwise produce the hash of a truncated file.
+		if (!input.eof())
+		{
+			errorMessage = "read error while hashing";
+			return false;
 		}
 
 		DWORD hashLength = 0;
@@ -1719,10 +1764,10 @@ namespace File
 static int lua_Init(lua_State* L)
 {
 	// File method table
+	// File method table. It used to be published as the global
+	// _bzfile_impl_file_table as well, which nothing read.
 	lua_newtable(L);
 	int fileMethodTable = lua_gettop(L);
-	lua_pushvalue(L, fileMethodTable); // the next function will pop this but we still want the table on the stack
-	lua_setglobal(L, "_bzfile_impl_file_table");
 
 	lua_pushcfunction(L, &File::Guarded<&File::Write>);
 	lua_setfield(L, -2, "Write");
@@ -1747,7 +1792,7 @@ static int lua_Init(lua_State* L)
 
 	// File Metatables
 
-	luaL_newmetatable(L, "FileMetatable");
+	luaL_newmetatable(L, File::kFileMetatable);
 	lua_pushstring(L, "__gc");
 	lua_pushcfunction(L, &File::Guarded<&File::Cleanup>);
 	lua_settable(L, -3);
