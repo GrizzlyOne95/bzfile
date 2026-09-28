@@ -136,6 +136,32 @@ test_write_policy() {
     pass "write policy"
 }
 
+# The shared BZR documents must stay byte-identical across ExtraUtilities,
+# BZR-OpenShim, Campaign Reimagined and bzfile. Each repository pins the same
+# SHA-256 hashes (of the file bytes with CRLF normalised to LF, so Windows and
+# Linux checkouts agree); see GrizzlyOne95/ExtraUtilities#65.
+test_shared_bzr_docs() {
+    local -A expected=(
+        [Docs/BZR_LUA_AGENT_REFERENCE.md]=95a146ae81c94a84c2b4c0767f7e2a6ab4aa1ee40148e2414a72733b13ac2fd1
+        [Docs/BZR_PLATFORM_COMPATIBILITY.md]=b9af9f6452996080a046949f3164e102ec8aa4eefaa9d0c4b8d194e52b516fb3
+    )
+    local hasher doc actual
+    if command -v sha256sum >/dev/null 2>&1; then
+        hasher=(sha256sum)
+    elif command -v shasum >/dev/null 2>&1; then
+        hasher=(shasum -a 256)
+    else
+        fail "no sha256sum or shasum for the shared BZR document check"
+    fi
+    for doc in "${!expected[@]}"; do
+        [[ -f "$ROOT/$doc" ]] || fail "shared document $doc is missing"
+        actual="$(perl -0777 -pe 's/\r\n/\n/g' "$ROOT/$doc" | "${hasher[@]}" | cut -d' ' -f1)"
+        [[ "$actual" == "${expected[$doc]}" ]] \
+            || fail "$doc has SHA-256 $actual, expected ${expected[$doc]}. Make the same change in ExtraUtilities, BZR-OpenShim, Campaign Reimagined and bzfile, then update the pinned hashes in each repository's check."
+    done
+    pass "shared BZR documents match the pinned hashes"
+}
+
 test_script_syntax() {
     local script
     for script in \
@@ -350,6 +376,7 @@ test_backups_uninstall_and_deploy_wrapper() {
 }
 
 test_version_header
+test_shared_bzr_docs
 test_write_policy
 test_script_syntax
 test_steam_path_override
