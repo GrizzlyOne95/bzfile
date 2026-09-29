@@ -268,7 +268,7 @@ bzfile.StageOpenShimSuiteUpdate(
     patchesSource: string, patchesSha256: string)
     -> success: boolean, stateOrError: string, helperLogPath?: string
 ```
-Stages the complete Campaign Reimagined native suite as one verified
+Stages the legacy single-DLL Campaign Reimagined native suite as one verified
 transaction. Sources are restricted to `winmm.dll`,
 `openshim_net.ini.payload`, and `openshim_patches.json.payload` beside the
 loaded `bzfile.dll`; destinations are fixed to the game-root `winmm.dll`,
@@ -277,6 +277,26 @@ before game exit, backs up all existing destinations, promotes and verifies all
 three payloads, and rolls the suite back if any promotion or verification
 fails. Progress is written to `openshim_update.status` and details to
 `openshim_update.log`.
+
+```lua
+bzfile.StageOpenShimSuiteUpdateV3(
+    winmmSource: string, winmmSha256: string,
+    networkSource: string, networkSha256: string,
+    patchesSource: string, patchesSha256: string,
+    loaderSource: string, loaderSha256: string,
+    pluginSource: string, pluginSha256: string,
+    helperSha256: string)
+    -> success: boolean, stateOrError: string, helperLogPath?: string
+```
+Installs the split OpenShim load chain in one five-file transaction. In
+addition to the three legacy payloads, sources must be `bzloader.dll` and
+`openshim.dll` beside the loaded `bzfile.dll`; their fixed destinations are
+game-root `bzloader.dll` and `plugins/openshim.dll`. All three DLLs must be
+x86 PE DLLs. The helper beside bzfile is hash-verified and locked against
+changes until it is launched. This entry point requires exactly eleven
+arguments and uses the separate `--suite-v3` helper protocol, so an older
+helper cannot install just part of the chain. The legacy entry point accepts
+exactly six arguments and remains available for old monolithic packages.
 
 Both staging functions refuse while an update helper is already running (see
 `IsOpenShimUpdateActive`), and write `state=failed` if the helper cannot be
