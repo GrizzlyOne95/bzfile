@@ -87,6 +87,10 @@ jobs:
         shell: pwsh
         run: .\tests\Test-LuaHost.ps1 -HostPath .\tests\lua_host\bin\bzfile_lua_host.exe -DllPath .\Release\bzfile.dll
 
+      - name: Test complete split suite installation through real Lua
+        shell: pwsh
+        run: .\tests\Test-SuiteStaging.ps1
+
       - name: Upload verified binaries
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
