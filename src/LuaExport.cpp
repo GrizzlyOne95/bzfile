@@ -1406,7 +1406,7 @@ namespace File
 		return 3;
 	}
 
-	static int StageOpenShimSuiteUpdate(lua_State* L)
+	static int StageOpenShimSuiteUpdateImpl(lua_State* L, bool splitChain)
 	{
 		struct Payload
 		{
@@ -1420,18 +1420,29 @@ namespace File
 
 		// Every Lua argument is read before any destructible object exists: a
 		// luaL_checkstring type error longjmps and would skip the destructors
-		// of the module paths below. For the same reason all three staged
+		// of the module paths below. For the same reason all staged
 		// paths are resolved before the payload vector is built.
-		const char* requestedStaged[3] = {
+		if (lua_gettop(L) != (splitChain ? 11 : 6))
+		{
+			lua_pushboolean(L, 0);
+			lua_pushstring(L, "wrong suite staging argument count (version mismatch)");
+			return 2;
+		}
+		const char* requestedStaged[5] = {
 			luaL_checkstring(L, 1),
 			luaL_checkstring(L, 3),
-			luaL_checkstring(L, 5)
+			luaL_checkstring(L, 5),
+			splitChain ? luaL_checkstring(L, 7) : nullptr,
+			splitChain ? luaL_checkstring(L, 9) : nullptr
 		};
-		const char* requestedHashes[3] = {
+		const char* requestedHashes[5] = {
 			luaL_checkstring(L, 2),
 			luaL_checkstring(L, 4),
-			luaL_checkstring(L, 6)
+			luaL_checkstring(L, 6),
+			splitChain ? luaL_checkstring(L, 8) : nullptr,
+			splitChain ? luaL_checkstring(L, 10) : nullptr
 		};
+		const char* requestedHelperHash = splitChain ? luaL_checkstring(L, 11) : nullptr;
 
 		const std::filesystem::path modulePath = GetCurrentModulePath();
 		if (modulePath.empty())
@@ -1449,9 +1460,9 @@ namespace File
 			return 2;
 		}
 
-		std::filesystem::path stagedPaths[3];
+		std::filesystem::path stagedPaths[5];
 		std::string pathError;
-		for (int stagedIndex = 0; stagedIndex < 3; ++stagedIndex)
+		for (int stagedIndex = 0; stagedIndex < (splitChain ? 5 : 3); ++stagedIndex)
 		{
 			if (!TryResolveAllowedPath(requestedStaged[stagedIndex], stagedPaths[stagedIndex], pathError))
 			{
@@ -1486,6 +1497,15 @@ namespace File
 				gameRoot / L"scripts" / L"patches.json.previous"
 			}
 		};
+
+		if (splitChain)
+		{
+			payloads.push_back({ stagedPaths[3], requestedHashes[3], L"bzloader.dll",
+				gameRoot / L"bzloader.dll", {}, gameRoot / L"bzloader.dll.previous" });
+			payloads.push_back({ stagedPaths[4], requestedHashes[4], L"openshim.dll",
+				gameRoot / L"plugins" / L"openshim.dll", {},
+				gameRoot / L"plugins" / L"openshim.dll.previous" });
+		}
 
 		for (size_t index = 0; index < payloads.size(); ++index)
 		{
@@ -1523,7 +1543,7 @@ namespace File
 				return 2;
 			}
 
-			if (index == 0 && !IsX86PortableExecutable(payload.source, validationError))
+			if ((index == 0 || index >= 3) && !IsX86PortableExecutable(payload.source, validationError))
 			{
 				lua_pushboolean(L, 0);
 				lua_pushfstring(L, "OpenShim PE validation failed: %s", validationError.c_str());
@@ -1544,6 +1564,31 @@ namespace File
 			lua_pushboolean(L, 0);
 			lua_pushstring(L, "bzfile_replace_helper.exe is missing beside bzfile.dll");
 			return 2;
+		}
+
+		// Keep the attested helper immutable from hashing until CreateProcess
+		// has mapped it. Lua cannot supply another executable or destination.
+		struct HelperLock
+		{
+			HANDLE handle = INVALID_HANDLE_VALUE;
+			~HelperLock() { if (handle != INVALID_HANDLE_VALUE) CloseHandle(handle); }
+		} helperLock;
+		if (splitChain)
+		{
+			helperLock.handle = CreateFileW(helperPath.c_str(), GENERIC_READ, FILE_SHARE_READ,
+				nullptr, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
+			std::string helperHash;
+			std::string helperError;
+			std::string expectedHelperHash = requestedHelperHash;
+			for (char& ch : expectedHelperHash)
+				ch = static_cast<char>(std::tolower(static_cast<unsigned char>(ch)));
+			if (helperLock.handle == INVALID_HANDLE_VALUE || !IsSha256(expectedHelperHash) ||
+				!ComputeSha256(helperPath, helperHash, helperError) || helperHash != expectedHelperHash)
+			{
+				lua_pushboolean(L, 0);
+				lua_pushstring(L, "replacement helper could not be locked and verified against its manifest");
+				return 2;
+			}
 		}
 
 		// See StageOpenShimUpdate: never stage over a helper that is running.
@@ -1577,7 +1622,7 @@ namespace File
 		}
 
 		std::vector<std::wstring> arguments = {
-			L"--suite",
+			splitChain ? L"--suite-v3" : L"--suite",
 			std::to_wstring(GetCurrentProcessId()),
 			logPath.wstring(),
 			statusPath.wstring()
@@ -1616,6 +1661,16 @@ namespace File
 		lua_pushstring(L, "staged");
 		lua_pushstring(L, DisplayPath(logPath).c_str());
 		return 3;
+	}
+
+	static int StageOpenShimSuiteUpdate(lua_State* L)
+	{
+		return StageOpenShimSuiteUpdateImpl(L, false);
+	}
+
+	static int StageOpenShimSuiteUpdateV3(lua_State* L)
+	{
+		return StageOpenShimSuiteUpdateImpl(L, true);
 	}
 
 	static int Delete(lua_State* L)
@@ -1957,6 +2012,7 @@ extern "C" int __declspec(dllexport) luaopen_bzfile(lua_State* L)
 		{ "GetFileVersion", &File::Guarded<&File::GetFileVersion> },
 		{ "StageOpenShimUpdate", &File::Guarded<&File::StageOpenShimUpdate> },
 		{ "StageOpenShimSuiteUpdate", &File::Guarded<&File::StageOpenShimSuiteUpdate> },
+		{ "StageOpenShimSuiteUpdateV3", &File::Guarded<&File::StageOpenShimSuiteUpdateV3> },
 		{ "IsOpenShimUpdateActive", &File::Guarded<&File::IsOpenShimUpdateActive> },
 		{ "Delete", &File::Guarded<&File::Delete> },
 		{ "ListDirectory", &File::Guarded<&File::ListDirectory> },

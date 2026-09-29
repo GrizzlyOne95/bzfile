@@ -120,13 +120,14 @@ try {
 
     # Three-file suite success: the campaign updater depends on all three files
     # being promoted as one verified transaction with backups of old payloads.
-    $suite = Join-Path $root "suite"
+    foreach ($protocol in @(@{Mode="--suite"; Count=3}, @{Mode="--suite-v3"; Count=5})) {
+    $suite = Join-Path $root ("suite-" + $protocol.Count)
     New-Item -ItemType Directory -Path $suite -Force | Out-Null
     $suiteLog = Join-Path $suite "suite.log"
     $suiteStatus = Join-Path $suite "suite.status"
-    $suiteArgs = @("--suite", (Get-ExitedProcessId), $suiteLog, $suiteStatus)
+    $suiteArgs = @($protocol.Mode, (Get-ExitedProcessId), $suiteLog, $suiteStatus)
     $expectedHashes = @()
-    for ($i = 1; $i -le 3; $i++) {
+    for ($i = 1; $i -le $protocol.Count; $i++) {
         $suiteStaged = Join-Path $suite ("staged$i.bin")
         $suiteDestination = Join-Path $suite ("destination$i.bin")
         $suiteBackup = Join-Path $suite ("backup$i.bin")
@@ -140,9 +141,10 @@ try {
     $exitCode = Invoke-Helper $suiteArgs
     Assert-True ($exitCode -eq 0) "suite replacement returned exit code $exitCode"
     Assert-True ((Get-Content -LiteralPath $suiteStatus -Raw) -match "state=complete") "suite status did not reach complete"
-    for ($i = 1; $i -le 3; $i++) {
+    for ($i = 1; $i -le $protocol.Count; $i++) {
         Assert-True ((Get-Sha (Join-Path $suite "destination$i.bin")) -eq $expectedHashes[$i - 1]) "suite destination $i hash is wrong"
         Assert-True ((Get-Content -LiteralPath (Join-Path $suite "backup$i.bin") -Raw) -eq "old-$i") "suite backup $i is wrong"
+    }
     }
 
     # Waits for a live game, and a second helper steps aside without touching
@@ -183,8 +185,8 @@ try {
     New-Item -ItemType Directory -Path $rollback -Force | Out-Null
     $rollbackLog = Join-Path $rollback "suite.log"
     $rollbackStatus = Join-Path $rollback "suite.status"
-    $rollbackArgs = @("--suite", (Get-ExitedProcessId), $rollbackLog, $rollbackStatus)
-    for ($i = 1; $i -le 3; $i++) {
+    $rollbackArgs = @("--suite-v3", (Get-ExitedProcessId), $rollbackLog, $rollbackStatus)
+    for ($i = 1; $i -le 5; $i++) {
         $rollbackStaged = Join-Path $rollback ("staged$i.bin")
         Write-AsciiFile $rollbackStaged ("new-$i")
         Write-AsciiFile (Join-Path $rollback ("destination$i.bin")) ("old-$i")
@@ -192,7 +194,7 @@ try {
     }
 
     # Readable (so the backup can be taken) but not replaceable.
-    $lock = [System.IO.File]::Open((Join-Path $rollback "destination2.bin"), "Open", "Read", "Read")
+    $lock = [System.IO.File]::Open((Join-Path $rollback "destination5.bin"), "Open", "Read", "Read")
     try {
         $exitCode = Invoke-Helper $rollbackArgs
     }
@@ -200,7 +202,7 @@ try {
         $lock.Dispose()
     }
     Assert-True ($exitCode -eq 1) "suite with a locked destination returned exit code $exitCode"
-    for ($i = 1; $i -le 3; $i++) {
+    for ($i = 1; $i -le 5; $i++) {
         Assert-True ((Get-Content -LiteralPath (Join-Path $rollback "destination$i.bin") -Raw) -eq "old-$i") "rollback left destination $i changed"
         Assert-True (-not (Test-Path -LiteralPath (Join-Path $rollback "staged$i.bin"))) "rollback left staged file $i behind"
     }

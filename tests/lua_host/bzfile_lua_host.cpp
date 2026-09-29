@@ -41,7 +41,7 @@ namespace
 
 int wmain(int argc, wchar_t** argv)
 {
-	if (argc != 2)
+	if (argc != 2 && argc != 3)
 	{
 		std::fputs("usage: bzfile_lua_host.exe <script.lua> | --expect-unsupported-build\n", stderr);
 		return 2;
@@ -70,6 +70,8 @@ int wmain(int argc, wchar_t** argv)
 	std::wstring dllPath(exePath, exeLength);
 	dllPath.resize(dllPath.find_last_of(L"\\/") + 1);
 	dllPath += L"bzfile.dll";
+	if (argc == 3)
+		dllPath = argv[2];
 
 	HMODULE bzfile = LoadLibraryExW(dllPath.c_str(), nullptr, LOAD_WITH_ALTERED_SEARCH_PATH);
 	if (bzfile == nullptr)

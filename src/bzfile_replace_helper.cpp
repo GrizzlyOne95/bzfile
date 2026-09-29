@@ -509,14 +509,16 @@ namespace
 
 	int RunSuiteUpdate(const std::vector<std::wstring>& arguments)
 	{
-		// executable, --suite, pid, log, status, then three groups of
+		// executable, --suite/--suite-v3, pid, log, status, then three/five groups of
 		// staged/destination/hash/backup.
-		if (arguments.size() != 17)
+		const size_t expectedCount = arguments[1] == L"--suite-v3" ? 25 : 17;
+		if (arguments.size() != expectedCount)
 		{
 			if (arguments.size() >= 5)
 			{
 				WriteStatus(arguments[4], L"failed", L"",
-					L"helper received " + std::to_wstring(arguments.size()) + L" arguments; expected 17 (version mismatch?)");
+					L"helper received " + std::to_wstring(arguments.size()) + L" arguments; expected " +
+					std::to_wstring(expectedCount) + L" (version mismatch?)");
 			}
 			return kExitBadArguments;
 		}
@@ -740,7 +742,7 @@ namespace
 	// Where a failure can still be reported if something throws.
 	std::filesystem::path StatusPathFromArguments(const std::vector<std::wstring>& arguments)
 	{
-		if (arguments.size() >= 5 && arguments[1] == L"--suite")
+		if (arguments.size() >= 5 && (arguments[1] == L"--suite" || arguments[1] == L"--suite-v3"))
 		{
 			return arguments[4];
 		}
@@ -768,7 +770,7 @@ int APIENTRY wWinMain(HINSTANCE, HINSTANCE, PWSTR, int)
 	// the game would keep reporting the update as pending.
 	try
 	{
-		if (arguments.size() > 1 && arguments[1] == L"--suite")
+		if (arguments.size() > 1 && (arguments[1] == L"--suite" || arguments[1] == L"--suite-v3"))
 		{
 			return RunSuiteUpdate(arguments);
 		}
