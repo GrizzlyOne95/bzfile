@@ -28,13 +28,13 @@ Opens a file, creating it if write mode is requested and the file is absent. Val
 
 | Method | Return | Behavior |
 | --- | --- | --- |
-| `file:Write(content: string)` | `self` | Write bytes without adding a newline. |
-| `file:Writeln(content: string)` | `self` | Write content followed by a newline. |
+| `file:Write(content: string)` | `self` or `nil, errorMessage` | Write bytes without adding a newline. Returns `nil, errorMessage` if the write failed (handle not opened for writing, disk full). |
+| `file:Writeln(content: string)` | `self` or `nil, errorMessage` | Write content followed by a newline. Fails like `Write`. |
 | `file:Read(count: int?)` | `string?` | Read up to `count` bytes/characters from the current position (default 1). Returns `nil` at EOF. `0` yields `""`; negative counts or counts over 64 MiB raise an argument error. |
 | `file:Readln()` | `string?` | Read the next line; `nil` at EOF. |
 | `file:Dump()` | `string? , errorMessage?` | Seek to the beginning and read the **entire** file, regardless of prior `Read`/`Readln` calls. Over 64 MiB returns `nil, errorMessage`; a write-only handle returns `""`. Text mode translates line endings, so use `rb` for exact bytes. |
-| `file:Flush()` | `self` | Flush buffered writes. May reduce performance if called excessively. |
-| `file:Close()` | `nil` | Close the handle. The Lua variable is not automatically set to `nil`; further methods raise. |
+| `file:Flush()` | `self` or `nil, errorMessage` | Flush buffered writes. May reduce performance if called excessively. |
+| `file:Close()` | `true` or `nil, errorMessage` | Close the handle. Small writes are buffered, so a full disk may only be reported here: check the result when saving data that matters. The Lua variable is not automatically set to `nil`; further methods raise. |
 
 Example reading one line at a time:
 
@@ -65,7 +65,7 @@ Finds `...\steamapps\workshop\content\301650` from a Steam library installation.
 
 `bzfile.MakeDirectory(path: string) -> success: boolean , errorMessage?`
 
-Creates a directory and any missing parents, within an allowed root and outside write-protected names.
+Creates a directory and any missing parents, within an allowed root and outside write-protected names (a missing parent with a protected name is refused too).
 
 `bzfile.Exists(path: string) -> exists: boolean , errorMessage?`
 
