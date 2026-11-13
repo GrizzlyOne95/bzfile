@@ -48,6 +48,25 @@ for _, name in ipairs({
 end
 
 check(refused(bzfile.MakeDirectory(path("winmm.dll"))), "MakeDirectory refuses a protected name")
+check(refused(bzfile.MakeDirectory(path("squat.dll\\"))), "MakeDirectory refuses a protected name with a trailing separator")
+check(refused(bzfile.MakeDirectory(path("squat2.dll\\sub"))), "MakeDirectory refuses a protected missing parent")
+check(not bzfile.Exists(path("squat.dll")) and not bzfile.Exists(path("squat2.dll")), "refused MakeDirectory created nothing")
+
+-- Write failures are reported -------------------------------------------
+
+do
+    local out = assert(bzfile.Open(path("report.txt"), "w", "trunc"))
+    check(out:Write("a") == out and out:Writeln("b") == out and out:Flush() == out, "successful writes still return self")
+    check(out:Close() == true, "Close returns true")
+
+    local readOnly = assert(bzfile.Open(path("report.txt"), "r"))
+    check(refused(readOnly:Write("lost")), "Write on a read-only handle reports failure")
+    readOnly:Close()
+
+    local reader = assert(bzfile.Open(path("report.txt"), "r"))
+    while reader:Readln() do end
+    check(reader:Close() == true, "Close after reading to EOF is not a failure")
+end
 
 writeRaw("plain.txt", "plain")
 check(refused(bzfile.CopyFile(path("plain.txt"), path("copied.dll"), true)), "CopyFile refuses a protected destination")

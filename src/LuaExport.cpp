@@ -694,6 +694,15 @@ namespace File
 		const char* content = luaL_checklstring(L, 2, &len);
 		handle->write(content, len);
 
+		// A handle opened without "w", a full disk or a failing volume used to
+		// drop the bytes and still return self, so a lost save looked written.
+		if (handle->fail())
+		{
+			lua_pushnil(L);
+			lua_pushstring(L, "bzfile Error: write failed");
+			return 2;
+		}
+
 		lua_pushvalue(L, 1);
 		return 1;
 	}
@@ -707,6 +716,13 @@ namespace File
 		const char* content = luaL_checklstring(L, 2, &len);
 		handle->write(content, len);
 		handle->put('\n');
+
+		if (handle->fail())
+		{
+			lua_pushnil(L);
+			lua_pushstring(L, "bzfile Error: write failed");
+			return 2;
+		}
 
 		lua_pushvalue(L, 1);
 		return 1;
@@ -852,19 +868,38 @@ namespace File
 		if (!handle->is_open()) return luaL_error(L, "bzfile Error: file is not open");
 		handle->flush();
 
+		// badbit only: failbit is also left behind by a read that reached EOF,
+		// which is not a flush failure.
+		if (handle->bad())
+		{
+			lua_pushnil(L);
+			lua_pushstring(L, "bzfile Error: flush failed");
+			return 2;
+		}
+
 		lua_pushvalue(L, 1);
 		return 1;
 	}
 
-	// This will make the file handle nil in lua
+	// Returns true, or nil+message when the final flush of buffered writes
+	// failed (full disk): that is the only place such a loss can be reported.
 	static int Close(lua_State* L)
 	{
 		std::fstream* handle = (std::fstream*)luaL_checkudata(L, 1, kFileMetatable);
 		if (handle->is_open())
 		{
+			// Drop eof/fail left by earlier reads so only close() itself counts.
+			handle->clear();
 			handle->close();
+			if (handle->fail())
+			{
+				lua_pushnil(L);
+				lua_pushstring(L, "bzfile Error: close failed, buffered writes may be lost");
+				return 2;
+			}
 		}
-		return 0;
+		lua_pushboolean(L, 1);
+		return 1;
 	}
 
 	static int GetWorkingDirectory(lua_State* L)
@@ -913,6 +948,25 @@ namespace File
 		{
 			return PushPathRejectionFalse(
 				L, "bzfile Error: path is write-protected: \"" + DisplayPath(directory) + "\"");
+		}
+
+		// create_directories also creates every missing parent, so each one
+		// that does not exist yet is checked too: "bzloader.dll\" (empty leaf)
+		// and "bzloader.dll\sub" both used to create the protected name.
+		for (auto parent = directory.parent_path();
+			!parent.empty() && parent != parent.parent_path();
+			parent = parent.parent_path())
+		{
+			std::error_code existsError;
+			if (std::filesystem::exists(parent, existsError))
+			{
+				break;
+			}
+			if (IsWriteProtected(parent))
+			{
+				return PushPathRejectionFalse(
+					L, "bzfile Error: path is write-protected: \"" + DisplayPath(parent) + "\"");
+			}
 		}
 
 		std::error_code error;
